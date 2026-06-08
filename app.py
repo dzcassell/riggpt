@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RigGPT v2.13.44
+RigGPT v2.13.45
 Features: Multi-TTS * Audio Effects * Voice Presets * SSTV * Scheduling
           Transmission Logging * Live Dashboard (SSE) * Beacon Mode
           Roger Beep * Waterfall Image Transmission * AI Integration Framework
@@ -316,6 +316,7 @@ import logging
 import requests
 import inspect
 from io import BytesIO
+from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timezone
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context, make_response
@@ -394,7 +395,7 @@ logger.setLevel(getattr(logging, _log_level, logging.DEBUG))
 # -------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------
-VERSION        = 'v2.13.44'
+VERSION        = 'v2.13.45'
 RADIO_MODEL    = 'IC-7610'
 SERIAL_PORT    = '/dev/ttyIC7610'  # udev persistent symlink (falls back to ttyUSB0/1)
 BAUD_RATE      = 57600             # must match CI-V USB Baud Rate in radio SET menu
@@ -493,6 +494,10 @@ def _load_app_settings() -> dict:
 
 def _save_app_settings(settings: dict) -> bool:
     try:
+        # Snapshot under the lock so json.dump serializes a stable dict and can't
+        # raise "changed size during iteration" if another thread adds a key.
+        with _app_settings_lock:
+            settings = dict(settings)
         Path(APP_SETTINGS_FILE).parent.mkdir(parents=True, exist_ok=True)
         # Write to a temp file in the same directory then atomically replace it,
         # so a crash/disk-full mid-write can never truncate the live settings
@@ -514,6 +519,9 @@ def _save_app_settings(settings: dict) -> bool:
         logger.error(f'save_app_settings error: {e}')
         return False
 
+# Guards read-modify-write of the in-memory _app_settings dict. Reentrant so a
+# writer holding the lock can call _save_app_settings (which re-acquires it).
+_app_settings_lock = threading.RLock()
 _app_settings = _load_app_settings()
 
 def get_gong_path() -> str:
@@ -3482,21 +3490,24 @@ def api_waterfall_advanced():
     source = data.get('source', 'image')  # 'image' or 'hell'
     canned = data.get('canned', '')
     hell_text    = data.get('hell_text', '').strip().upper()
-    hell_repeat  = max(1, min(5, int(data.get('hell_repeat', 2))))
-    image_width  = int(data.get('image_width', 128))
-    image_height = int(data.get('image_height', 64))
-    base_freq    = float(data.get('base_freq', 200))
-    bandwidth    = float(data.get('bandwidth', 2400))
-    frame_dur    = float(data.get('frame_duration', 0.1))
-    contrast     = float(data.get('contrast', 2.0))
+    try:
+        hell_repeat  = max(1, min(5, int(data.get('hell_repeat', 2))))
+        image_width  = int(data.get('image_width', 128))
+        image_height = int(data.get('image_height', 64))
+        base_freq    = float(data.get('base_freq', 200))
+        bandwidth    = float(data.get('bandwidth', 2400))
+        frame_dur    = float(data.get('frame_duration', 0.1))
+        contrast     = float(data.get('contrast', 2.0))
 
-    # CI-V mode params
-    panorama_span   = int(data.get('panorama_span', 30000))
-    panorama_step   = int(data.get('panorama_step', 3000))
-    diagonal_hz     = int(data.get('diagonal_hz_per_row', 50))
-    bounce_offset   = int(data.get('bounce_offset', 10000))
-    bounce_freq_b   = int(data.get('bounce_freq_b', 0))
-    bounce_rows     = int(data.get('bounce_rows', 4))
+        # CI-V mode params
+        panorama_span   = int(data.get('panorama_span', 30000))
+        panorama_step   = int(data.get('panorama_step', 3000))
+        diagonal_hz     = int(data.get('diagonal_hz_per_row', 50))
+        bounce_offset   = int(data.get('bounce_offset', 10000))
+        bounce_freq_b   = int(data.get('bounce_freq_b', 0))
+        bounce_rows     = int(data.get('bounce_rows', 4))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'message': 'numeric waterfall parameters must be valid numbers'}), 400
 
     agent = orchestrator.icom_agent
     if not agent or not agent.serial_conn or not agent.serial_conn.is_open:
@@ -4179,9 +4190,12 @@ def api_radio_set_frequency():
     freq = data.get('frequency_hz') or data.get('frequency_mhz')
     if freq is None:
         return jsonify({'success': False, 'message': 'frequency_hz or frequency_mhz required'}), 400
-    if data.get('frequency_mhz'):
-        freq = int(float(data['frequency_mhz']) * 1e6)
-    freq = int(freq)
+    try:
+        if data.get('frequency_mhz'):
+            freq = int(float(data['frequency_mhz']) * 1e6)
+        freq = int(freq)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'message': 'frequency must be numeric'}), 400
     if not (30000 <= freq <= 74800000):
         return jsonify({'success': False, 'message': f'Frequency {freq} Hz out of range (30 kHz - 74.8 MHz)'}), 400
     ok = orchestrator.icom_agent.set_frequency(freq)
@@ -4202,7 +4216,10 @@ def api_radio_get_mode():
 def api_radio_set_mode():
     data   = request.json or {}
     mode   = (data.get('mode') or '').upper().strip()
-    filt   = int(data.get('filter', 1))
+    try:
+        filt = int(data.get('filter', 1))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'message': 'filter must be an integer'}), 400
     valid  = ['LSB','USB','AM','CW','RTTY','FM','WFM','CW-R','RTTY-R','DV','USB-D','LSB-D']
     if mode not in valid:
         return jsonify({'success': False,
@@ -4591,6 +4608,7 @@ def api_tx_terminate():
 _heartbeat_last     = 0.0       # time.time() of last heartbeat
 _heartbeat_watchdog = None      # watchdog thread
 _heartbeat_active   = False     # watchdog is running
+_heartbeat_lock     = threading.Lock()  # guards the watchdog check-then-start
 
 def _heartbeat_kill_all():
     """Emergency stop: terminate TX, PTT off, stop all scheduled ops."""
@@ -4663,13 +4681,17 @@ def _heartbeat_watchdog_loop():
 def api_heartbeat():
     global _heartbeat_last, _heartbeat_watchdog, _heartbeat_active
     _heartbeat_last = time_module.time()
-    # Start watchdog on first heartbeat if not already running
-    if not _heartbeat_active and _app_settings.get('heartbeat_enabled', 'false') == 'true':
-        _heartbeat_active = True
-        _heartbeat_watchdog = threading.Thread(
-            target=_heartbeat_watchdog_loop, daemon=True, name='heartbeat-watchdog')
-        _heartbeat_watchdog.start()
-        logger.info('heartbeat: watchdog started (15s timeout)')
+    # Start watchdog on first heartbeat if not already running. Lock the
+    # check-then-set so two near-simultaneous heartbeats (e.g. multiple tabs)
+    # can't both pass the guard and spawn duplicate watchdog threads.
+    if _app_settings.get('heartbeat_enabled', 'false') == 'true':
+        with _heartbeat_lock:
+            if not _heartbeat_active:
+                _heartbeat_active = True
+                _heartbeat_watchdog = threading.Thread(
+                    target=_heartbeat_watchdog_loop, daemon=True, name='heartbeat-watchdog')
+                _heartbeat_watchdog.start()
+                logger.info('heartbeat: watchdog started (15s timeout)')
     return jsonify({'ok': True})
 
 
@@ -4877,13 +4899,14 @@ def api_settings_post():
         'irc_mode',
     }
     updated = {}
-    for k, v in patch.items():
-        if k in allowed:
-            _app_settings[k] = str(v).strip()
-            updated[k] = _app_settings[k]
-    if updated:
-        _save_app_settings(_app_settings)
-        log_event('INFO', 'SETTINGS', f'Updated settings: {list(updated.keys())}')
+    with _app_settings_lock:
+        for k, v in patch.items():
+            if k in allowed:
+                _app_settings[k] = str(v).strip()
+                updated[k] = _app_settings[k]
+        if updated:
+            _save_app_settings(_app_settings)
+            log_event('INFO', 'SETTINGS', f'Updated settings: {list(updated.keys())}')
     return jsonify({'success': True, 'updated': updated, 'settings': _app_settings})
 
 
@@ -5063,22 +5086,23 @@ def api_config_import():
         'memory_enabled', 'memory_qdrant_host', 'memory_embed_model',
     }
     settings_patch = data.get('settings', {})
-    for k, v in settings_patch.items():
-        if k in SETTINGS_ALLOWED:
-            _app_settings[k] = v
-            results['settings_applied'].append(k)
-        elif not k.startswith('__'):
-            results['skipped'].append(f'settings.{k} (unknown key)')
+    with _app_settings_lock:
+        for k, v in settings_patch.items():
+            if k in SETTINGS_ALLOWED:
+                _app_settings[k] = v
+                results['settings_applied'].append(k)
+            elif not k.startswith('__'):
+                results['skipped'].append(f'settings.{k} (unknown key)')
 
-    # -- 2. ui_presets ----------------------------------------
-    ui_patch = data.get('ui_presets', {})
-    for k, v in ui_patch.items():
-        if k in SETTINGS_ALLOWED:
-            _app_settings[k] = v
-            results['ui_presets_applied'].append(k)
+        # -- 2. ui_presets ----------------------------------------
+        ui_patch = data.get('ui_presets', {})
+        for k, v in ui_patch.items():
+            if k in SETTINGS_ALLOWED:
+                _app_settings[k] = v
+                results['ui_presets_applied'].append(k)
 
-    if results['settings_applied'] or results['ui_presets_applied']:
-        _save_app_settings(_app_settings)
+        if results['settings_applied'] or results['ui_presets_applied']:
+            _save_app_settings(_app_settings)
 
     # -- 3. API keys ------------------------------------------
     if _api_keys_ok:
@@ -5252,11 +5276,12 @@ def api_ai_config_post():
     allowed = {'ollama_url','ollama_model','ollama_enabled','ai_persona',
                'ai_temp','ai_max_tokens','ai_mode'}
     changed = {}
-    for k, v in data.items():
-        if k in allowed:
-            _app_settings[k] = v
-            changed[k] = v
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        for k, v in data.items():
+            if k in allowed:
+                _app_settings[k] = v
+                changed[k] = v
+        _save_app_settings(_app_settings)
     _ailog('INFO', f'Config saved: {changed}')
     return jsonify({'success': True})
 
@@ -5934,17 +5959,19 @@ def api_ai_examples_save():
     for ex in examples:
         if not isinstance(ex, dict) or 'label' not in ex or 'prompt' not in ex:
             return jsonify({'success': False, 'message': 'Each example needs label + prompt'}), 400
-    _app_settings['ai_example_prompts'] = json.dumps(examples)
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        _app_settings['ai_example_prompts'] = json.dumps(examples)
+        _save_app_settings(_app_settings)
     return jsonify({'success': True, 'message': f'Saved {len(examples)} example prompts'})
 
 
 @app.route('/api/ai/examples/reset', methods=['POST'])
 def api_ai_examples_reset():
     """Reset example prompts to defaults."""
-    if 'ai_example_prompts' in _app_settings:
-        del _app_settings['ai_example_prompts']
-        _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        if 'ai_example_prompts' in _app_settings:
+            del _app_settings['ai_example_prompts']
+            _save_app_settings(_app_settings)
     return jsonify({'success': True, 'message': 'Reset to default examples'})
 
 
@@ -6343,13 +6370,12 @@ es.onmessage = e=>{
 @app.route('/api/trip/transcripts', methods=['GET'])
 def api_trip_transcripts_list():
     limit = min(100, max(1, request.args.get('limit', 50, type=int)))
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        'SELECT id,timestamp,topic,agent_a_name,agent_b_name,turn_count,model_a,model_b,notes '
-        'FROM trip_transcripts ORDER BY id DESC LIMIT ?', (limit,)
-    ).fetchall()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            'SELECT id,timestamp,topic,agent_a_name,agent_b_name,turn_count,model_a,model_b,notes '
+            'FROM trip_transcripts ORDER BY id DESC LIMIT ?', (limit,)
+        ).fetchall()
     return jsonify({'success': True, 'transcripts': [dict(r) for r in rows]})
 
 
@@ -6360,33 +6386,31 @@ def api_trip_transcripts_save():
     if not all(data.get(k) for k in required):
         return jsonify({'success': False, 'message': 'transcript field required'}), 400
     ts = time_module.strftime('%Y-%m-%dT%H:%M:%SZ', time_module.gmtime())
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute(
-        'INSERT INTO trip_transcripts (timestamp,topic,agent_a_name,agent_b_name,turn_count,model_a,model_b,transcript,notes) '
-        'VALUES (?,?,?,?,?,?,?,?,?)',
-        (ts,
-         _ascii(data.get('topic', '')),
-         _ascii(data.get('agent_a_name', '')),
-         _ascii(data.get('agent_b_name', '')),
-         int(data.get('turn_count', 0)),
-         _ascii(data.get('model_a', '')),
-         _ascii(data.get('model_b', '')),
-         data.get('transcript', ''),
-         _ascii(data.get('notes', '')))
-    )
-    new_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute(
+            'INSERT INTO trip_transcripts (timestamp,topic,agent_a_name,agent_b_name,turn_count,model_a,model_b,transcript,notes) '
+            'VALUES (?,?,?,?,?,?,?,?,?)',
+            (ts,
+             _ascii(data.get('topic', '')),
+             _ascii(data.get('agent_a_name', '')),
+             _ascii(data.get('agent_b_name', '')),
+             int(data.get('turn_count', 0)),
+             _ascii(data.get('model_a', '')),
+             _ascii(data.get('model_b', '')),
+             data.get('transcript', ''),
+             _ascii(data.get('notes', '')))
+        )
+        new_id = cur.lastrowid
+        conn.commit()
     logger.info(f'Trip transcript saved: id={new_id}')
     return jsonify({'success': True, 'id': new_id, 'timestamp': ts})
 
 
 @app.route('/api/trip/transcripts/<int:tid>', methods=['GET'])
 def api_trip_transcripts_get(tid):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute('SELECT * FROM trip_transcripts WHERE id=?', (tid,)).fetchone()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT * FROM trip_transcripts WHERE id=?', (tid,)).fetchone()
     if not row:
         return jsonify({'success': False, 'message': 'Not found'}), 404
     return jsonify({'success': True, 'transcript': dict(row)})
@@ -6394,10 +6418,9 @@ def api_trip_transcripts_get(tid):
 
 @app.route('/api/trip/transcripts/<int:tid>', methods=['DELETE'])
 def api_trip_transcripts_delete(tid):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('DELETE FROM trip_transcripts WHERE id=?', (tid,))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute('DELETE FROM trip_transcripts WHERE id=?', (tid,))
+        conn.commit()
     return jsonify({'success': True})
 
 
@@ -6405,12 +6428,11 @@ def api_trip_transcripts_delete(tid):
 
 @app.route('/api/trip/scenarios', methods=['GET'])
 def api_trip_scenarios_list():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        'SELECT id,name,created,updated FROM trip_scenarios ORDER BY name'
-    ).fetchall()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            'SELECT id,name,created,updated FROM trip_scenarios ORDER BY name'
+        ).fetchall()
     return jsonify({'success': True, 'scenarios': [dict(r) for r in rows]})
 
 
@@ -6423,30 +6445,28 @@ def api_trip_scenarios_save():
         return jsonify({'success': False, 'message': 'name and payload required'}), 400
     ts = time_module.strftime('%Y-%m-%dT%H:%M:%SZ', time_module.gmtime())
     payload_str = json.dumps(payload) if not isinstance(payload, str) else payload
-    conn = sqlite3.connect(DB_PATH)
-    # Upsert: update if name exists, insert if not
-    existing = conn.execute('SELECT id FROM trip_scenarios WHERE name=?', (name,)).fetchone()
-    if existing:
-        conn.execute('UPDATE trip_scenarios SET payload=?,updated=? WHERE name=?',
-                     (payload_str, ts, name))
-        sid = existing[0]
-    else:
-        cur = conn.execute(
-            'INSERT INTO trip_scenarios (name,created,updated,payload) VALUES (?,?,?,?)',
-            (name, ts, ts, payload_str)
-        )
-        sid = cur.lastrowid
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        # Upsert: update if name exists, insert if not
+        existing = conn.execute('SELECT id FROM trip_scenarios WHERE name=?', (name,)).fetchone()
+        if existing:
+            conn.execute('UPDATE trip_scenarios SET payload=?,updated=? WHERE name=?',
+                         (payload_str, ts, name))
+            sid = existing[0]
+        else:
+            cur = conn.execute(
+                'INSERT INTO trip_scenarios (name,created,updated,payload) VALUES (?,?,?,?)',
+                (name, ts, ts, payload_str)
+            )
+            sid = cur.lastrowid
+        conn.commit()
     return jsonify({'success': True, 'id': sid, 'name': name})
 
 
 @app.route('/api/trip/scenarios/<int:sid>', methods=['GET'])
 def api_trip_scenarios_get(sid):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute('SELECT * FROM trip_scenarios WHERE id=?', (sid,)).fetchone()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT * FROM trip_scenarios WHERE id=?', (sid,)).fetchone()
     if not row:
         return jsonify({'success': False, 'message': 'Not found'}), 404
     d = dict(row)
@@ -6459,10 +6479,9 @@ def api_trip_scenarios_get(sid):
 
 @app.route('/api/trip/scenarios/<int:sid>', methods=['DELETE'])
 def api_trip_scenarios_delete(sid):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('DELETE FROM trip_scenarios WHERE id=?', (sid,))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute('DELETE FROM trip_scenarios WHERE id=?', (sid,))
+        conn.commit()
     return jsonify({'success': True})
 
 
@@ -9102,8 +9121,9 @@ def api_alexa_toggle():
     """Enable or disable Alexa mode."""
     global _app_settings
     enabled = not _alexa_get_enabled()
-    _app_settings['alexa_enabled'] = 'true' if enabled else 'false'
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        _app_settings['alexa_enabled'] = 'true' if enabled else 'false'
+        _save_app_settings(_app_settings)
     logger.info(f'alexa: {"ENABLED" if enabled else "DISABLED"}')
     return jsonify({'enabled': enabled})
 
@@ -11285,11 +11305,12 @@ def api_numbers_station_start():
     engine   = data.get('engine', _app_settings.get('numbers_station_engine', 'espeak'))
     voice    = data.get('voice', _app_settings.get('numbers_station_voice', ''))
     cadence  = data.get('cadence', _app_settings.get('numbers_station_cadence', 'medium'))
-    _app_settings['numbers_station_interval'] = str(interval)
-    _app_settings['numbers_station_engine']   = engine
-    _app_settings['numbers_station_voice']    = voice
-    _app_settings['numbers_station_cadence']  = cadence
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        _app_settings['numbers_station_interval'] = str(interval)
+        _app_settings['numbers_station_engine']   = engine
+        _app_settings['numbers_station_voice']    = voice
+        _app_settings['numbers_station_cadence']  = cadence
+        _save_app_settings(_app_settings)
     try:
         if _numbers_station_job:
             try: _numbers_station_job.remove()
@@ -11494,9 +11515,10 @@ def api_mystery_schedule():
     window_end   = int(data.get('window_end_hour',
                         int(_app_settings.get('mystery_window_end', 4))))
     window_end   = max(window_end, window_start + 1)
-    _app_settings['mystery_window_start'] = str(window_start)
-    _app_settings['mystery_window_end']   = str(window_end)
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        _app_settings['mystery_window_start'] = str(window_start)
+        _app_settings['mystery_window_end']   = str(window_end)
+        _save_app_settings(_app_settings)
     hour   = random.randint(window_start, window_end - 1)
     minute = random.randint(0, 59)
     cron   = f'{minute} {hour} * * *'
@@ -11576,11 +11598,12 @@ def api_autoid_start():
                           int(_app_settings.get('autoid_interval', 10)))))
     engine   = data.get('engine', _app_settings.get('autoid_engine', 'cw'))
     voice    = data.get('voice', _app_settings.get('autoid_voice', ''))
-    _app_settings['autoid_callsign'] = callsign
-    _app_settings['autoid_interval'] = str(interval)
-    _app_settings['autoid_engine']   = engine
-    _app_settings['autoid_voice']    = voice
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        _app_settings['autoid_callsign'] = callsign
+        _app_settings['autoid_interval'] = str(interval)
+        _app_settings['autoid_engine']   = engine
+        _app_settings['autoid_voice']    = voice
+        _save_app_settings(_app_settings)
     try:
         if _autoid_job:
             try: _autoid_job.remove()
@@ -11646,10 +11669,11 @@ def api_timeannounce_start():
                           int(_app_settings.get('timeannounce_interval', 30)))))
     engine   = data.get('engine', _app_settings.get('timeannounce_engine', 'espeak'))
     voice    = data.get('voice', _app_settings.get('timeannounce_voice', ''))
-    _app_settings['timeannounce_interval'] = str(interval)
-    _app_settings['timeannounce_engine']   = engine
-    _app_settings['timeannounce_voice']    = voice
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        _app_settings['timeannounce_interval'] = str(interval)
+        _app_settings['timeannounce_engine']   = engine
+        _app_settings['timeannounce_voice']    = voice
+        _save_app_settings(_app_settings)
     try:
         if _timeannounce_job:
             try: _timeannounce_job.remove()
@@ -11851,10 +11875,11 @@ def api_evp_start():
                    int(_app_settings.get('evp_interval', '3')))))
     engine = data.get('engine', _app_settings.get('evp_engine', 'espeak'))
     voice  = data.get('voice', _app_settings.get('evp_voice', ''))
-    _app_settings['evp_interval'] = str(interval)
-    _app_settings['evp_engine']   = engine
-    _app_settings['evp_voice']    = voice
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        _app_settings['evp_interval'] = str(interval)
+        _app_settings['evp_engine']   = engine
+        _app_settings['evp_voice']    = voice
+        _save_app_settings(_app_settings)
     try:
         if _evp_job:
             try: _evp_job.remove()
@@ -11978,10 +12003,11 @@ def api_whisper_start():
                    int(_app_settings.get('whisper_interval', '5')))))
     engine = data.get('engine', _app_settings.get('whisper_engine', 'espeak'))
     voice  = data.get('voice', _app_settings.get('whisper_voice', ''))
-    _app_settings['whisper_interval'] = str(interval)
-    _app_settings['whisper_engine']   = engine
-    _app_settings['whisper_voice']    = voice
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        _app_settings['whisper_interval'] = str(interval)
+        _app_settings['whisper_engine']   = engine
+        _app_settings['whisper_voice']    = voice
+        _save_app_settings(_app_settings)
     try:
         if _whisper_job:
             try: _whisper_job.remove()
@@ -12504,6 +12530,7 @@ def api_sentient_start():
 
     data = request.json or {}
     # Save all settings
+    _sentient_patch = {}
     for key, el_id, default in [
         ('sentient_audio_in',       'audio_in',      AUDIO_DEVICE or 'plughw:0,0'),
         ('sentient_whisper_model',  'whisper_model',  'base'),
@@ -12520,8 +12547,10 @@ def api_sentient_start():
         ('sentient_handshake',      'handshake',      'true'),
     ]:
         val = data.get(el_id, _app_settings.get(key, default))
-        _app_settings[key] = str(val)
-    _save_app_settings(_app_settings)
+        _sentient_patch[key] = str(val)
+    with _app_settings_lock:
+        _app_settings.update(_sentient_patch)
+        _save_app_settings(_app_settings)
 
     _sentient_stop.clear()
     _sentient_active = True
@@ -13148,10 +13177,11 @@ def api_pirate_start():
                           int(_app_settings.get('pirate_interval', 15)))))
     engine   = data.get('engine', _app_settings.get('pirate_engine', 'espeak'))
     voice    = data.get('voice', _app_settings.get('pirate_voice', ''))
-    _app_settings['pirate_interval'] = str(interval)
-    _app_settings['pirate_engine']   = engine
-    _app_settings['pirate_voice']    = voice
-    _save_app_settings(_app_settings)
+    with _app_settings_lock:
+        _app_settings['pirate_interval'] = str(interval)
+        _app_settings['pirate_engine']   = engine
+        _app_settings['pirate_voice']    = voice
+        _save_app_settings(_app_settings)
     try:
         if _pirate_job:
             try: _pirate_job.remove()
