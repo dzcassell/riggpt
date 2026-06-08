@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RigGPT v2.13.46
+RigGPT v2.13.47
 Features: Multi-TTS * Audio Effects * Voice Presets * SSTV * Scheduling
           Transmission Logging * Live Dashboard (SSE) * Beacon Mode
           Roger Beep * Waterfall Image Transmission * AI Integration Framework
@@ -395,7 +395,7 @@ logger.setLevel(getattr(logging, _log_level, logging.DEBUG))
 # -------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------
-VERSION        = 'v2.13.46'
+VERSION        = 'v2.13.47'
 RADIO_MODEL    = 'IC-7610'
 SERIAL_PORT    = '/dev/ttyIC7610'  # udev persistent symlink (falls back to ttyUSB0/1)
 BAUD_RATE      = 57600             # must match CI-V USB Baud Rate in radio SET menu
@@ -4833,7 +4833,6 @@ def api_settings_post():
         # AI tab TX voice
         'ai_tx_engine', 'ai_tx_voice', 'ai_auto_tx',
         # Acid Trip agent presets
-        'trip_a_name', 'trip_b_name',
         'trip_a_emoji', 'trip_a_engine', 'trip_a_voice',
         'trip_a_provider', 'trip_a_model', 'trip_a_model_sel',
         'trip_a_persona', 'trip_a_canon', 'trip_a_seed',
@@ -4976,14 +4975,12 @@ def api_config_export():
         'ai_tx_voice':   _app_settings.get('ai_tx_voice', ''),
         'ai_auto_tx':    _app_settings.get('ai_auto_tx', False),
         # Acid Trip agent A
-        'trip_a_name':     _app_settings.get('trip_a_name', 'Alex'),
         'trip_a_emoji':    _app_settings.get('trip_a_emoji', '\U0001f47d'),
         'trip_a_engine':   _app_settings.get('trip_a_engine', 'espeak'),
         'trip_a_voice':    _app_settings.get('trip_a_voice', ''),
         'trip_a_provider': _app_settings.get('trip_a_provider', 'ollama'),
         'trip_a_model':    _app_settings.get('trip_a_model', ''),
         # Acid Trip agent B
-        'trip_b_name':     _app_settings.get('trip_b_name', 'Art'),
         'trip_b_emoji':    _app_settings.get('trip_b_emoji', '\U0001f335'),
         'trip_b_engine':   _app_settings.get('trip_b_engine', 'espeak'),
         'trip_b_voice':    _app_settings.get('trip_b_voice', ''),
@@ -5068,9 +5065,9 @@ def api_config_import():
         # AI TX voice (saved from AI tab)
         'ai_tx_engine', 'ai_tx_voice', 'ai_auto_tx',
         # Acid Trip agents
-        'trip_a_name', 'trip_a_emoji', 'trip_a_engine', 'trip_a_voice',
+        'trip_a_emoji', 'trip_a_engine', 'trip_a_voice',
         'trip_a_provider', 'trip_a_model',
-        'trip_b_name', 'trip_b_emoji', 'trip_b_engine', 'trip_b_voice',
+        'trip_b_emoji', 'trip_b_engine', 'trip_b_voice',
         'trip_b_provider', 'trip_b_model',
         'trip_turns', 'trip_delay', 'trip_max_tok', 'trip_temp',
         # Transmit tab defaults
