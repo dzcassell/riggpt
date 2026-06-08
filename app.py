@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RigGPT v2.13.43
+RigGPT v2.13.44
 Features: Multi-TTS * Audio Effects * Voice Presets * SSTV * Scheduling
           Transmission Logging * Live Dashboard (SSE) * Beacon Mode
           Roger Beep * Waterfall Image Transmission * AI Integration Framework
@@ -394,7 +394,7 @@ logger.setLevel(getattr(logging, _log_level, logging.DEBUG))
 # -------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------
-VERSION        = 'v2.13.43'
+VERSION        = 'v2.13.44'
 RADIO_MODEL    = 'IC-7610'
 SERIAL_PORT    = '/dev/ttyIC7610'  # udev persistent symlink (falls back to ttyUSB0/1)
 BAUD_RATE      = 57600             # must match CI-V USB Baud Rate in radio SET menu
@@ -494,8 +494,21 @@ def _load_app_settings() -> dict:
 def _save_app_settings(settings: dict) -> bool:
     try:
         Path(APP_SETTINGS_FILE).parent.mkdir(parents=True, exist_ok=True)
-        with open(APP_SETTINGS_FILE, 'w') as f:
-            json.dump(settings, f, indent=2)
+        # Write to a temp file in the same directory then atomically replace it,
+        # so a crash/disk-full mid-write can never truncate the live settings
+        # file (a corrupt file silently reverts the user's entire config).
+        _dir = os.path.dirname(APP_SETTINGS_FILE) or '.'
+        _fd, _tmp = tempfile.mkstemp(prefix='.app_settings.', suffix='.tmp', dir=_dir)
+        try:
+            with os.fdopen(_fd, 'w') as f:
+                json.dump(settings, f, indent=2)
+            os.replace(_tmp, APP_SETTINGS_FILE)
+        except Exception:
+            try:
+                os.unlink(_tmp)
+            except Exception:
+                pass
+            raise
         return True
     except Exception as e:
         logger.error(f'save_app_settings error: {e}')
@@ -680,31 +693,45 @@ class IcomSerialAgent:
             self.port = port
         if baud:
             self.baudrate = baud
-        try:
-            self.serial_conn = serial.Serial(
-                port=self.port, baudrate=self.baudrate,
-                bytesize=8, parity='N', stopbits=1, timeout=0.1,
-                xonxoff=False, rtscts=False, dsrdtr=False
-            )
-            self.serial_conn.dtr = True
-            self.serial_conn.rts = True
-            time_module.sleep(0.2)
-            self.serial_conn.reset_input_buffer()
-            logger.info(f"Serial connected: {self.port} @ {self.baudrate}")
-            return True
-        except Exception as e:
-            logger.error(f"Serial connect failed {self.port}: {e}")
-            self.serial_conn = None
-            return False
+        with self._lock:
+            # Close any existing handle before reopening so a reconnect (e.g. the
+            # poller's auto-reconnect) doesn't leak the previous OS file descriptor.
+            if self.serial_conn:
+                try:
+                    if self.serial_conn.is_open:
+                        self.serial_conn.dtr = False
+                        self.serial_conn.close()
+                except Exception:
+                    pass
+                self.serial_conn = None
+            try:
+                self.serial_conn = serial.Serial(
+                    port=self.port, baudrate=self.baudrate,
+                    bytesize=8, parity='N', stopbits=1, timeout=0.1,
+                    xonxoff=False, rtscts=False, dsrdtr=False
+                )
+                self.serial_conn.dtr = True
+                self.serial_conn.rts = True
+                time_module.sleep(0.2)
+                self.serial_conn.reset_input_buffer()
+                logger.info(f"Serial connected: {self.port} @ {self.baudrate}")
+                return True
+            except Exception as e:
+                logger.error(f"Serial connect failed {self.port}: {e}")
+                self.serial_conn = None
+                return False
 
     def disconnect(self):
-        try:
-            if self.serial_conn and self.serial_conn.is_open:
-                self.serial_conn.dtr = False
-                self.serial_conn.close()
-        except Exception:
-            pass
-        self.serial_conn = None
+        # Hold the same lock send_command uses so an in-flight CI-V read on the
+        # poller thread can't race with the handle being closed/nulled here.
+        with self._lock:
+            try:
+                if self.serial_conn and self.serial_conn.is_open:
+                    self.serial_conn.dtr = False
+                    self.serial_conn.close()
+            except Exception:
+                pass
+            self.serial_conn = None
 
     def _build_packet(self, *cmd_bytes):
         return bytes(
@@ -1349,6 +1376,10 @@ class SpeechifyTTSAgent:
         if not output_path:
             _fd, output_path = tempfile.mkstemp(suffix='.mp3')
             os.close(_fd)
+        # Escape XML metacharacters so &, <, > in the text don't produce invalid
+        # SSML (the un-cleaned dub/trenchtown route reaches here with raw text).
+        import xml.sax.saxutils as _saxutils
+        ssml_text = _saxutils.escape(text or '')
         try:
             resp = requests.post(
                 'https://api.sws.speechify.com/v1/audio/speech',
@@ -1358,7 +1389,7 @@ class SpeechifyTTSAgent:
                     'Accept':        'audio/mpeg',
                 },
                 json={
-                    'input':   f'<speak>{text}</speak>',
+                    'input':   f'<speak>{ssml_text}</speak>',
                     'voice_id': voice,
                     'audio_format': 'mp3',
                 },
@@ -1478,7 +1509,9 @@ class ElevenLabsTTSAgent:
         try:
             resp = requests.get('https://api.elevenlabs.io/v1/voices',
                                 headers={'xi-api-key': ELEVENLABS_API_KEY}, timeout=10)
-            return {v['voice_id']: v['name'] for v in resp.json().get('voices', [])}
+            # Use .get so one malformed voice entry can't drop the entire list.
+            return {v.get('voice_id', ''): v.get('name', '')
+                    for v in resp.json().get('voices', []) if v.get('voice_id')}
         except Exception:
             return {}
 
@@ -4226,31 +4259,35 @@ def api_audio_calibrate():
         """PTT on, play tone, read ALC during playback, PTT off."""
         alc_readings = []
         agent.ptt_on()
-        time_module.sleep(0.15)
+        # Guarantee PTT is released even if ALC sampling or playback raises —
+        # never leave the transmitter keyed on an exception path.
+        try:
+            time_module.sleep(0.15)
 
-        play_thread_done = threading.Event()
-        def _play():
-            cmd = ['aplay']
-            if AUDIO_DEVICE and AUDIO_DEVICE != 'default':
-                cmd += ['-D', AUDIO_DEVICE]
-            cmd.append(tone_path)
-            subprocess.run(cmd, capture_output=True, timeout=10)
-            play_thread_done.set()
+            play_thread_done = threading.Event()
+            def _play():
+                cmd = ['aplay']
+                if AUDIO_DEVICE and AUDIO_DEVICE != 'default':
+                    cmd += ['-D', AUDIO_DEVICE]
+                cmd.append(tone_path)
+                subprocess.run(cmd, capture_output=True, timeout=10)
+                play_thread_done.set()
 
-        t = threading.Thread(target=_play, daemon=True)
-        t.start()
+            t = threading.Thread(target=_play, daemon=True)
+            t.start()
 
-        # Sample ALC every 50 ms while tone plays
-        deadline = time_module.time() + tone_dur + 0.3
-        while time_module.time() < deadline and not play_thread_done.is_set():
-            alc = agent.read_alc()
-            if alc is not None:
-                alc_readings.append(alc)
-            time_module.sleep(0.05)
+            # Sample ALC every 50 ms while tone plays
+            deadline = time_module.time() + tone_dur + 0.3
+            while time_module.time() < deadline and not play_thread_done.is_set():
+                alc = agent.read_alc()
+                if alc is not None:
+                    alc_readings.append(alc)
+                time_module.sleep(0.05)
 
-        play_thread_done.wait(timeout=2)
-        time_module.sleep(0.1)
-        agent.ptt_off()
+            play_thread_done.wait(timeout=2)
+            time_module.sleep(0.1)
+        finally:
+            agent.ptt_off()
         return int(sum(alc_readings) / len(alc_readings)) if alc_readings else None
 
     try:
@@ -4781,6 +4818,7 @@ def api_settings_post():
         # AI tab TX voice
         'ai_tx_engine', 'ai_tx_voice', 'ai_auto_tx',
         # Acid Trip agent presets
+        'trip_a_name', 'trip_b_name',
         'trip_a_emoji', 'trip_a_engine', 'trip_a_voice',
         'trip_a_provider', 'trip_a_model', 'trip_a_model_sel',
         'trip_a_persona', 'trip_a_canon', 'trip_a_seed',
@@ -8188,7 +8226,7 @@ def _dbot_engine():
 
 @app.route('/api/dbot/start', methods=['POST'])
 def api_dbot_start():
-    global _dbot_thread
+    global _dbot_thread, _dbot_active
     if _dbot_active:
         return jsonify({'success': False, 'message': 'Bot engine already running'})
     # Verify Discord is configured
@@ -8209,6 +8247,10 @@ def api_dbot_start():
     _dbot_stop.clear()
     with _dbot_lock:
         _dbot_state['enabled'] = True
+    # Set the guard flag BEFORE spawning so a second rapid /api/dbot/start can't
+    # slip past the `if _dbot_active` check during thread-startup latency and
+    # launch a duplicate engine (the engine also sets it True, idempotently).
+    _dbot_active = True
     _dbot_thread = threading.Thread(target=_dbot_engine, daemon=True, name='dbot-engine')
     _dbot_thread.start()
     logger.info(f'dbot: engine started (channel={channel_id}, persona={_dbot_state["persona"]}, '
@@ -12439,8 +12481,17 @@ def _sentient_listener_loop():
     except Exception as e:
         _sentient_log_entry('ERROR', f'Listener crashed: {e}')
     finally:
-        try: proc.terminate()
-        except Exception: pass
+        # Reap the arecord child (wait) and close its pipes so repeated
+        # start/stop cycles don't leak zombie processes and pipe FDs.
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+        except Exception:
+            pass
         _sentient_active = False
         _sentient_log_entry('SYSTEM', 'Listener stopped')
 
@@ -12630,15 +12681,19 @@ def _ghost_whisper(ghost_name: str, stop: threading.Event):
         _ghost_log_event(f'{ghost_name}: whisper error: {e}')
 
 
-def _ghost_run_poltergeist(stop: threading.Event, intensity: int = 3):
+def _ghost_run_poltergeist(stop: threading.Event, intensity: int = 3, manage_state: bool = True):
     """
     VFO POLTERGEIST: randomly shifts the VFO frequency by ±(50-2000) Hz
     every 1-4 seconds.  Restores original frequency when done.
     intensity: 1=subtle (±50Hz), 3=medium (±500Hz), 5=unhinged (±5000Hz)
     """
     global _ghost_active, _ghost_name
-    _ghost_active = True
-    _ghost_name   = 'VFO POLTERGEIST'
+    # When run as an exorcist sub-ghost (manage_state=False) we must NOT touch the
+    # shared ghost flags — the parent owns them. Otherwise this sub-ghost exiting
+    # would clear _ghost_active mid-possession and let a duplicate ghost start.
+    if manage_state:
+        _ghost_active = True
+        _ghost_name   = 'VFO POLTERGEIST'
     import random
     agent = orchestrator.icom_agent
     original_freq = None
@@ -12668,18 +12723,20 @@ def _ghost_run_poltergeist(stop: threading.Event, intensity: int = 3):
         if original_freq and _ghost_connected():
             agent.set_frequency(original_freq)
             _ghost_log_event(f'poltergeist: restored {original_freq/1e6:.4f}MHz')
-        _ghost_active = False
-        _ghost_name   = ''
+        if manage_state:
+            _ghost_active = False
+            _ghost_name   = ''
 
 
-def _ghost_run_passband(stop: threading.Event, speed: float = 1.0):
+def _ghost_run_passband(stop: threading.Event, speed: float = 1.0, manage_state: bool = True):
     """
     PASSBAND POSSESSION: rapidly cycles the IF filter 1→2→3→2→1,
     making the audio sound like it's breathing/pulsing through the filter.
     """
     global _ghost_active, _ghost_name
-    _ghost_active = True
-    _ghost_name   = 'PASSBAND POSSESSION'
+    if manage_state:
+        _ghost_active = True
+        _ghost_name   = 'PASSBAND POSSESSION'
     import random
     agent  = orchestrator.icom_agent
     cycle  = [1, 2, 3, 2, 1, 3, 1]
@@ -12704,8 +12761,9 @@ def _ghost_run_passband(stop: threading.Event, speed: float = 1.0):
         if _ghost_connected():
             agent.set_mode('USB', filter_num=2)
             _ghost_log_event('passband: restored filter 2')
-        _ghost_active = False
-        _ghost_name   = ''
+        if manage_state:
+            _ghost_active = False
+            _ghost_name   = ''
 
 
 def _ghost_run_power_wobble(stop: threading.Event, depth: int = 50):
@@ -12747,14 +12805,15 @@ def _ghost_run_power_wobble(stop: threading.Event, depth: int = 50):
         _ghost_name   = ''
 
 
-def _ghost_run_agc_seizure(stop: threading.Event):
+def _ghost_run_agc_seizure(stop: threading.Event, manage_state: bool = True):
     """
     AGC SEIZURE: cycles AGC mode fast→mid→slow→off→fast in rapid succession.
     Makes the radio's gain hunting in unpredictable ways.
     """
     global _ghost_active, _ghost_name
-    _ghost_active = True
-    _ghost_name   = 'AGC SEIZURE'
+    if manage_state:
+        _ghost_active = True
+        _ghost_name   = 'AGC SEIZURE'
     import random
     agent  = orchestrator.icom_agent
     modes  = [1, 2, 3, 0, 1, 3, 2, 0]  # fast, mid, slow, off
@@ -12778,8 +12837,9 @@ def _ghost_run_agc_seizure(stop: threading.Event):
     finally:
         if _ghost_connected():
             orchestrator.icom_agent.set_agc(2)  # restore MID
-        _ghost_active = False
-        _ghost_name   = ''
+        if manage_state:
+            _ghost_active = False
+            _ghost_name   = ''
 
 
 def _ghost_run_split_personality(stop: threading.Event):
@@ -12907,9 +12967,9 @@ def _ghost_run_exorcist(stop: threading.Event, duration: int = 60):
         _ghost_log_event('EXORCIST: possession sequence initiated')
         # Spawn sub-ghosts
         for fn, kwargs in [
-            (_ghost_run_poltergeist, {'stop': sub_stop, 'intensity': 4}),
-            (_ghost_run_passband,    {'stop': sub_stop, 'speed': 3.0}),
-            (_ghost_run_agc_seizure, {'stop': sub_stop}),
+            (_ghost_run_poltergeist, {'stop': sub_stop, 'intensity': 4, 'manage_state': False}),
+            (_ghost_run_passband,    {'stop': sub_stop, 'speed': 3.0, 'manage_state': False}),
+            (_ghost_run_agc_seizure, {'stop': sub_stop, 'manage_state': False}),
         ]:
             t = threading.Thread(target=fn, kwargs=kwargs, daemon=True)
             threads.append(t)
@@ -12965,8 +13025,10 @@ def api_ghost_start():
         return jsonify({'success': False, 'message': f'Ghost already active: {_ghost_name}'}), 409
     data     = request.json or {}
     ghost_fn = data.get('ghost', 'poltergeist')
-    intensity = int(data.get('intensity', 3))
-    duration  = int(data.get('duration', 30))
+    # Clamp to documented ranges: intensity 1-5 (index into the drift table, an
+    # out-of-range value picks the wrong bucket), duration 1-600s (bound runaways).
+    intensity = min(max(int(data.get('intensity', 3)), 1), 5)
+    duration  = min(max(int(data.get('duration', 30)), 1), 600)
     _ghost_stop_event = threading.Event()
     ev = _ghost_stop_event
     fn_map = {
