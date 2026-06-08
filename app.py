@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RigGPT v2.13.47
+RigGPT v2.13.48
 Features: Multi-TTS * Audio Effects * Voice Presets * SSTV * Scheduling
           Transmission Logging * Live Dashboard (SSE) * Beacon Mode
           Roger Beep * Waterfall Image Transmission * AI Integration Framework
@@ -395,7 +395,7 @@ logger.setLevel(getattr(logging, _log_level, logging.DEBUG))
 # -------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------
-VERSION        = 'v2.13.47'
+VERSION        = 'v2.13.48'
 RADIO_MODEL    = 'IC-7610'
 SERIAL_PORT    = '/dev/ttyIC7610'  # udev persistent symlink (falls back to ttyUSB0/1)
 BAUD_RATE      = 57600             # must match CI-V USB Baud Rate in radio SET menu
@@ -10748,6 +10748,28 @@ _LIVE_PRESETS = {
                     'sox -n {out} synth 0.12 sine 700 : synth 0.06 sine 0 : synth 0.04 sine 700 : synth 0.06 sine 0 : synth 0.12 sine 700 fade 0.005 0.40 0.005'),
     'tones_3':     ('Three ascending tones',
                     'sox -n {out} synth 0.08 sine 600 : synth 0.08 sine 800 : synth 0.08 sine 1000 fade 0.005 0.24 0.01'),
+    # --- 8-bit / chiptune madness (all < 1.2s) -------------------------------
+    'beep_powerup':('8-bit power-up: rising square arpeggio',
+                    'sox -n {out} synth 0.05 square 523 : synth 0.05 square 659 : synth 0.05 square 784 : synth 0.05 square 1047 : synth 0.07 square 1568 fade 0 0.28 0.02'),
+    'beep_coin':   ('Arcade coin pickup',
+                    'sox -n {out} synth 0.06 square 988 : synth 0.30 square 1319 fade 0 0.36 0.05'),
+    'beep_laser':  ('Descending laser zap',
+                    'sox -n {out} synth 0.25 square 1800-300 fade 0 0.25 0.02'),
+    'beep_arcade': ('Rising arcade warble',
+                    'sox -n {out} synth 0.30 square 400-1600 tremolo 28 60 fade 0.005 0.30 0.02'),
+    'beep_glitch': ('Glitch stutter: square + noise bursts',
+                    'sox -n {out} synth 0.04 square 1500 : synth 0.03 whitenoise : synth 0.04 square 900 : synth 0.03 whitenoise : synth 0.05 square 1700 fade 0 0.19 0.01'),
+    'beep_ufo':    ('Warbling UFO',
+                    'sox -n {out} synth 0.12 sine 600 : synth 0.12 sine 950 : synth 0.12 sine 600 : synth 0.12 sine 950 : synth 0.12 sine 700 fade 0 0.60 0.04'),
+    'tones_arp_dn':('Descending triangle arpeggio',
+                    'sox -n {out} synth 0.07 triangle 1319 : synth 0.07 triangle 1047 : synth 0.07 triangle 784 : synth 0.07 triangle 523 fade 0 0.28 0.02'),
+    'beep_zap':    ('Overdriven zap',
+                    'sox -n {out} synth 0.18 square 2000-200 overdrive 18 fade 0 0.18 0.01'),
+    'beep_alarm8': ('8-bit two-tone alarm',
+                    'sox -n {out} synth 0.08 square 880 : synth 0.08 square 587 : synth 0.08 square 880 : synth 0.08 square 587 fade 0 0.32 0.01'),
+    'beep_dialup': ('Faux modem handshake',
+                    'sox -n {out} synth 0.12 sine 1200 : synth 0.10 pinknoise : synth 0.12 sine 2100 : synth 0.08 sine 980 fade 0 0.42 0.02'),
+    # -------------------------------------------------------------------------
     'robot_warble':('Robotic warble',
                     'sox -n {out} synth 0.40 sine 400 tremolo 12 80 fade 0.01 0.40 0.05'),
     'robot_buzz':  ('Robot buzz 300Hz square',
