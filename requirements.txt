@@ -1,4 +1,4 @@
-# RigGPT v2.13.48 -- Python Dependencies
+# RigGPT v2.13.49 -- Python Dependencies
 
 # Web framework
 flask>=2.3.0

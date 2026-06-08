@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RigGPT v2.13.48
+RigGPT v2.13.49
 Features: Multi-TTS * Audio Effects * Voice Presets * SSTV * Scheduling
           Transmission Logging * Live Dashboard (SSE) * Beacon Mode
           Roger Beep * Waterfall Image Transmission * AI Integration Framework
@@ -395,7 +395,7 @@ logger.setLevel(getattr(logging, _log_level, logging.DEBUG))
 # -------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------
-VERSION        = 'v2.13.48'
+VERSION        = 'v2.13.49'
 RADIO_MODEL    = 'IC-7610'
 SERIAL_PORT    = '/dev/ttyIC7610'  # udev persistent symlink (falls back to ttyUSB0/1)
 BAUD_RATE      = 57600             # must match CI-V USB Baud Rate in radio SET menu
@@ -968,6 +968,22 @@ class IcomSerialAgent:
         except Exception:
             pass
         return False
+
+    def read_tx_state_opt(self):
+        """Like read_tx_state but returns None when the radio didn't answer (or the
+        reply couldn't be parsed), so the live engine can distinguish a genuine
+        'now receiving' from a transient CI-V glitch and avoid a false edge."""
+        resp = self.send_command(0x1C, 0x00, quiet=True)
+        if not resp:
+            return None
+        try:
+            data = list(resp)
+            for i in range(len(data) - 3):
+                if data[i] == 0xFE and data[i+1] == 0xFE and data[i+4] == 0x1C:
+                    return bool(data[i+6])
+        except Exception:
+            pass
+        return None
 
     def set_frequency(self, freq_hz):
         """Set VFO frequency. freq_hz is an integer e.g. 14225000 for 14.225 MHz."""
@@ -10695,6 +10711,7 @@ _live_lock   = threading.Lock()
 _live_stop   = threading.Event()
 _live_thread = None
 _live_wobble_thread = None
+_live_render_cache = {}  # (sample_path, volume_pct) -> pre-rendered 48k-mono WAV path
 
 _live_state = {
     'enabled':         False,        # master toggle (engine on/off)
@@ -10823,6 +10840,37 @@ def _live_resolve_sample(name: str) -> str | None:
     return None
 
 
+def _live_render(sample_path: str, volume_pct: int) -> str:
+    """Return a 48k-mono WAV at the requested volume, cached by (path, volume).
+
+    The sox volume/format conversion is done HERE — outside the PTT-keyed window —
+    so the keyed window contains only aplay (no sox startup latency = no extra
+    dead air before the beep, and consistent timing). Cached, so steady-state
+    fires run zero sox. Falls back to the original file if sox fails.
+    """
+    if not sample_path:
+        return sample_path
+    vol = max(0, min(200, int(volume_pct)))
+    key = (sample_path, vol)
+    cached = _live_render_cache.get(key)
+    if cached and os.path.exists(cached):
+        return cached
+    safe = ''.join(c if c.isalnum() else '_' for c in os.path.basename(sample_path))
+    out = os.path.join(LIVE_DIR, f'_render_{safe}_{vol}.wav')
+    try:
+        r = subprocess.run(
+            ['sox', sample_path, '-r', '48000', '-c', '1', out, 'vol', str(vol / 100.0)],
+            capture_output=True, timeout=10
+        )
+        if r.returncode == 0 and os.path.exists(out):
+            _live_render_cache[key] = out
+            return out
+        logger.warning(f'live: render failed ({sample_path} @ {vol}%): {r.stderr.decode()[:120]}')
+    except Exception as e:
+        logger.warning(f'live: render error ({sample_path} @ {vol}%): {e}')
+    return sample_path
+
+
 def _live_play_sample(sample_path: str, volume_pct: int = 80, hold_after_ms: int = 0):
     """
     Re-key PTT, play a WAV/MP3 sample, then release PTT.
@@ -10830,6 +10878,7 @@ def _live_play_sample(sample_path: str, volume_pct: int = 80, hold_after_ms: int
     Audio plays through configured AUDIO_DEVICE which routes to radio mic mixer
     when MOD source is set to MIC,USB on the IC-7610.
     """
+    global _poller_paused
     if not sample_path or not os.path.exists(sample_path):
         logger.warning(f'live: sample not found: {sample_path}')
         return False
@@ -10838,34 +10887,16 @@ def _live_play_sample(sample_path: str, volume_pct: int = 80, hold_after_ms: int
         return False
 
     agent = orchestrator.icom_agent
+    dev = AUDIO_DEVICE or 'default'
+    # Render the volume-adjusted WAV BEFORE keying so the keyed window is just aplay
+    # (handles mp3->wav too). Cached, so repeat plays run zero sox.
+    play_path = _live_render(sample_path, volume_pct)
     with _live_lock:
         _live_state['self_keying'] = True
+    _poller_paused = True   # keep the dashboard poller off the serial bus during the beep
     try:
-        # Convert to WAV with adjusted volume if needed
-        play_path = sample_path
-        if volume_pct != 100 or sample_path.lower().endswith('.mp3'):
-            _fd, tmp_wav = tempfile.mkstemp(suffix='.wav', dir=LIVE_DIR)
-            os.close(_fd)
-            vol = max(0, min(200, volume_pct)) / 100.0
-            try:
-                r = subprocess.run(
-                    ['sox', sample_path, '-r', '48000', '-c', '1', tmp_wav, 'vol', str(vol)],
-                    capture_output=True, timeout=10
-                )
-                if r.returncode == 0:
-                    play_path = tmp_wav
-                else:
-                    try: os.remove(tmp_wav)
-                    except Exception: pass
-            except Exception as e:
-                logger.warning(f'live: sox volume adjust failed: {e}')
-                try: os.remove(tmp_wav)
-                except Exception: pass
-
-        # Re-key PTT and play
         agent.ptt_on()
         time_module.sleep(0.05)  # let PTT stabilize
-        dev = AUDIO_DEVICE or 'default'
         try:
             subprocess.run(['aplay', '-D', dev, '-q', play_path],
                            timeout=15, capture_output=True)
@@ -10874,11 +10905,6 @@ def _live_play_sample(sample_path: str, volume_pct: int = 80, hold_after_ms: int
         if hold_after_ms > 0:
             time_module.sleep(hold_after_ms / 1000.0)
         agent.ptt_off()
-
-        # Cleanup tmp file
-        if play_path != sample_path:
-            try: os.remove(play_path)
-            except Exception: pass
         return True
     except Exception as e:
         logger.error(f'live: play_sample error: {e}')
@@ -10886,6 +10912,7 @@ def _live_play_sample(sample_path: str, volume_pct: int = 80, hold_after_ms: int
         except Exception: pass
         return False
     finally:
+        _poller_paused = False  # always resume the dashboard poller
         time_module.sleep(0.10)  # debounce so TX edge detector doesn't see our keying
         with _live_lock:
             _live_state['self_keying'] = False
@@ -10893,6 +10920,7 @@ def _live_play_sample(sample_path: str, volume_pct: int = 80, hold_after_ms: int
 
 def _live_fire_effects():
     """Called on TX→RX edge. Fires all enabled effects sequentially."""
+    global _poller_paused
     snap = dict(_live_state)
     samples_to_play = []  # list of (path, vol, hold_ms)
 
@@ -10931,45 +10959,41 @@ def _live_fire_effects():
 
     if not samples_to_play:
         return
-
-    # Play all samples in one PTT keying sequence (more natural than separate keyings)
     if not orchestrator._connected:
         return
+
+    # Pre-render every sample to its volume-adjusted WAV BEFORE keying PTT, so the
+    # keyed window contains only aplay — no sox latency, no extra dead air, and
+    # consistent timing. Cached, so steady-state fires run zero sox here.
+    rendered = [(_live_render(path, vol), hold_ms) for path, vol, hold_ms in samples_to_play]
+
     agent = orchestrator.icom_agent
+    dev = AUDIO_DEVICE or 'default'
     with _live_lock:
         _live_state['self_keying'] = True
+    _poller_paused = True   # keep the dashboard poller off the serial bus during the beep
     try:
         agent.ptt_on()
-        time_module.sleep(0.05)
-        dev = AUDIO_DEVICE or 'default'
-        for path, vol, hold_ms in samples_to_play:
-            # Adjust volume via sox
-            _fd, tmp_wav = tempfile.mkstemp(suffix='.wav', dir=LIVE_DIR)
-            os.close(_fd)
+        time_module.sleep(0.05)  # let PTT engage before audio so the leading edge isn't clipped
+        for play_path, hold_ms in rendered:
             try:
-                v = max(0, min(200, vol)) / 100.0
-                r = subprocess.run(
-                    ['sox', path, '-r', '48000', '-c', '1', tmp_wav, 'vol', str(v)],
-                    capture_output=True, timeout=10
-                )
-                play_path = tmp_wav if r.returncode == 0 else path
                 subprocess.run(['aplay', '-D', dev, '-q', play_path],
                                timeout=15, capture_output=True)
+            except subprocess.TimeoutExpired:
+                logger.warning('live: aplay timeout')
             except Exception as e:
                 logger.warning(f'live: tap play error: {e}')
-            finally:
-                try: os.remove(tmp_wav)
-                except Exception: pass
             if hold_ms > 0:
                 time_module.sleep(hold_ms / 1000.0)
         agent.ptt_off()
-        _live_log(f'Fired {len(samples_to_play)} effect tap(s)')
+        _live_log(f'Fired {len(rendered)} effect tap(s)')
     except Exception as e:
         logger.error(f'live: fire_effects error: {e}')
         try: agent.ptt_off()
         except Exception: pass
     finally:
-        time_module.sleep(0.10)  # debounce
+        _poller_paused = False  # always resume the dashboard poller
+        time_module.sleep(0.10)  # debounce so the TX edge detector doesn't see our keying
         with _live_lock:
             _live_state['self_keying'] = False
 
@@ -11040,7 +11064,12 @@ def _live_engine():
                 continue
 
             agent = orchestrator.icom_agent
-            tx = agent.read_tx_state()
+            tx = agent.read_tx_state_opt()
+            if tx is None:
+                # No/garbled CI-V reply — treat as 'unknown', not RX, so a transient
+                # glitch can't fire a false roger beep. Keep last_tx and retry soon.
+                time_module.sleep(0.075 if last_tx else 0.2)
+                continue
             with _live_lock:
                 _live_state['tx_state'] = bool(tx)
 
@@ -11062,7 +11091,9 @@ def _live_engine():
                                  daemon=True, name='live-effects').start()
 
             last_tx = tx
-            time_module.sleep(0.2)  # 200ms poll
+            # Poll fast while transmitting so the PTT-release edge is caught within
+            # ~75ms (tight, consistent beep); poll slow while idle to limit bus load.
+            time_module.sleep(0.075 if tx else 0.2)
         except Exception as e:
             logger.warning(f'live: engine error: {e}')
             time_module.sleep(1)
