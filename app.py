@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RigGPT v2.13.45
+RigGPT v2.13.46
 Features: Multi-TTS * Audio Effects * Voice Presets * SSTV * Scheduling
           Transmission Logging * Live Dashboard (SSE) * Beacon Mode
           Roger Beep * Waterfall Image Transmission * AI Integration Framework
@@ -395,7 +395,7 @@ logger.setLevel(getattr(logging, _log_level, logging.DEBUG))
 # -------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------
-VERSION        = 'v2.13.45'
+VERSION        = 'v2.13.46'
 RADIO_MODEL    = 'IC-7610'
 SERIAL_PORT    = '/dev/ttyIC7610'  # udev persistent symlink (falls back to ttyUSB0/1)
 BAUD_RATE      = 57600             # must match CI-V USB Baud Rate in radio SET menu
@@ -1031,25 +1031,18 @@ class IcomSerialAgent:
         return None
 
     def set_af_gain(self, level):
-        """Set AF (audio) gain 0-255 (cmd 0x14 0x01)."""
-        hi = (level >> 8) & 0xFF
-        lo = level & 0xFF
-        resp = self.send_command(0x14, 0x01, hi, lo)
-        return resp is not None and 0xFB in resp
+        """Set AF (audio) gain 0-255 (cmd 0x14 0x01).
+
+        Delegates to the BCD-correct set_level. The IC-7610 expects the level
+        as 4-digit BCD (0000-0255), not a raw 16-bit split — the old inline
+        encoding here sent invalid BCD (e.g. 200 -> 0x00 0xC8) for any value
+        that wasn't coincidentally valid BCD.
+        """
+        return self.set_level(0x01, level)
 
     def read_af_gain(self):
-        """Read current AF gain (cmd 0x14 0x01)."""
-        resp = self.send_command(0x14, 0x01, quiet=True)
-        if not resp:
-            return None
-        try:
-            data = list(resp)
-            for i in range(len(data) - 4):
-                if data[i] == 0xFE and data[i+1] == 0xFE and data[i+4] == 0x14:
-                    return (data[i+6] << 8) | data[i+7]
-        except Exception:
-            pass
-        return None
+        """Read current AF gain (cmd 0x14 0x01), BCD-decoded via read_level."""
+        return self.read_level(0x01)
 
     def read_level(self, sub):
         """Generic level read: cmd 0x14, subcmd sub. Returns 0-255 (BCD decoded)."""
