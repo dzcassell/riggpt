@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>RigGPT</title>
+<style>
+  :root { color-scheme: dark; }
+  body { width: 300px; margin: 0; padding: 12px; background: #0b0e14; color: #d7dde8;
+         font: 12px/1.4 ui-monospace, Consolas, monospace; }
+  h1 { font-size: 13px; margin: 0 0 10px; color: #ff3366; letter-spacing: .5px; }
+  label { display: block; font-size: 10px; color: #8b95a7; margin-top: 8px; }
+  input[type=text], input[type=password] { width: 100%; box-sizing: border-box; background: #121824;
+         border: 1px solid #263044; color: #d7dde8; padding: 5px 6px; font: inherit; border-radius: 3px; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  button { flex: 1; padding: 8px; font: inherit; font-weight: 700; border: 1px solid #263044;
+           background: #182033; color: #d7dde8; border-radius: 3px; cursor: pointer; }
+  button.tx { background: #ff3366; border-color: #ff3366; color: #fff; }
+  button.stop { background: #2a1620; border-color: #ff3366; color: #ff3366; }
+  button:disabled { opacity: .5; cursor: default; }
+  .meter { height: 8px; background: #121824; border: 1px solid #263044; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .meter > div { height: 100%; width: 0; background: linear-gradient(90deg, #43b581, #ffaa00 70%, #ff3366); }
+  .status { margin-top: 8px; font-size: 10px; color: #8b95a7; min-height: 28px; white-space: pre-line; }
+  .status b { color: #43b581; }
+  .status .err { color: #ff3366; }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #8b95a7; margin-top: 8px; }
+  .tab { font-size: 10px; color: #8b95a7; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<h1>📡 RigGPT · TAB → RADIO</h1>
+
+<label>RigGPT host (ip:port)</label>
+<input type="text" id="host" placeholder="192.168.40.10:5000" spellcheck="false">
+
+<label>Stream token (leave blank if none set in RigGPT)</label>
+<input type="password" id="token" placeholder="optional">
+
+<label>Gain <span id="gain-v">100%</span></label>
+<input type="range" id="gain" min="0" max="300" value="100">
+
+<label class="check"><input type="checkbox" id="monitor" checked> Keep playing audio locally</label>
+
+<div class="tab" id="tab-title"></div>
+
+<div class="row">
+  <button id="start" class="tx">▶ TRANSMIT THIS TAB</button>
+  <button id="stop" class="stop" disabled>■ STOP</button>
+</div>
+
+<div class="meter"><div id="meter"></div></div>
+<div class="status" id="status">idle</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

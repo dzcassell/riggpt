@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "RigGPT Tab Audio → Radio",
+  "version": "1.0.0",
+  "description": "Streams the audio of the current Chrome tab (YouTube, etc.) to a RigGPT server on your LAN, which keys the IC-7610 and transmits it.",
+  "permissions": ["tabCapture", "offscreen", "storage", "activeTab"],
+  "host_permissions": ["http://*/*", "ws://*/*"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "RigGPT: transmit this tab",
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

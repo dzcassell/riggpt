@@ -1688,7 +1688,7 @@ hr.div  {
     <span class="sb-badge" id="sb-alerts"></span>
   </div>
   <div class="sb-seg" style="border-right:none">
-    <span class="sb-label">v2.13.49</span>
+    <span class="sb-label">v2.14.0</span>
   </div>
 </div>
 
@@ -3067,7 +3067,7 @@ hr.div  {
       <div style="padding:0 var(--s4) var(--s2);font-size:8px;color:var(--text3);flex-shrink:0">
         When enabled, all transmissions stop if the browser tab closes or loses connection (15s timeout).
       </div>
-      <div class="alert-strip" id="set-radio-alert"></div>
+      <div class="alert-strip" id="sys-radio-alert"></div>
       <pre class="probe-out" id="set-probe-out" style="flex:1"></pre>
     </div>
 
@@ -4428,6 +4428,55 @@ hr.div  {
         <button class="btn sm" onclick="liveTest('wobble')" style="width:100%;font-size:9px">🌀 TEST (3s, no TX)</button>
       </div>
 
+      <!-- Browser Tab Stream (Chrome extension) -->
+      <div class="card">
+        <div class="sec-head" style="color:#00c2ff">
+          <span style="flex:1">🌐 BROWSER STREAM</span>
+          <span id="stream-state" style="font-size:9px;color:var(--text3)">idle</span>
+        </div>
+        <div style="font-size:8px;color:var(--text3);line-height:1.5;margin-bottom:var(--s2)">
+          The <code>chrome-extension/</code> add-on sends the audio of a Chrome tab
+          (YouTube etc.) here over WebSocket; RigGPT keys PTT and plays it on the
+          radio's USB codec. PTT drops when the stream ends, on silence (VOX), or
+          at the max-minutes limit.
+        </div>
+        <div id="stream-title" style="font-size:9px;color:var(--cyan);margin-bottom:var(--s2);
+             overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</div>
+        <div style="display:flex;gap:var(--s2);align-items:center;margin-bottom:var(--s2)">
+          <div style="flex:1;height:6px;background:var(--bg3);border:1px solid var(--border);overflow:hidden">
+            <div id="stream-level" style="height:100%;width:0;background:linear-gradient(90deg,#43b581,#ffaa00 70%,#ff3366)"></div>
+          </div>
+          <span id="stream-elapsed" style="font-size:8px;font-family:var(--mono);color:var(--text3);width:38px;text-align:right">00:00</span>
+          <button class="btn sm danger" id="stream-stop-btn" onclick="streamStop()" style="font-size:9px" disabled>■ STOP</button>
+        </div>
+        <div class="form-row" style="margin-bottom:var(--s2)">
+          <label style="font-size:8px;width:60px">Token</label>
+          <input type="text" id="stream-token" placeholder="optional shared secret"
+                 onchange="streamSaveCfg()" style="flex:1;font-size:9px" autocomplete="off">
+        </div>
+        <div class="form-row" style="margin-bottom:var(--s2)">
+          <label style="font-size:8px;width:60px">Max TX</label>
+          <input type="number" id="stream-max-min" min="1" max="240" value="30"
+                 onchange="streamSaveCfg()" style="width:50px;font-size:9px">
+          <span style="font-size:8px;color:var(--text3)">min</span>
+          <label style="font-size:8px;margin-left:var(--s2)">Idle</label>
+          <input type="number" id="stream-idle-sec" min="2" max="60" value="5"
+                 onchange="streamSaveCfg()" style="width:44px;font-size:9px">
+          <span style="font-size:8px;color:var(--text3)">s</span>
+        </div>
+        <div class="form-row" style="margin-bottom:var(--s2)">
+          <label style="font-size:8px;width:60px">VOX drop</label>
+          <input type="number" id="stream-vox-sec" min="0" max="60" value="4"
+                 onchange="streamSaveCfg()" style="width:44px;font-size:9px">
+          <span style="font-size:8px;color:var(--text3)">s (0 = off)</span>
+          <label style="font-size:8px;margin-left:var(--s2)">below</label>
+          <input type="number" id="stream-vox-level" min="0" max="50" value="2"
+                 onchange="streamSaveCfg()" style="width:44px;font-size:9px">
+          <span style="font-size:8px;color:var(--text3)">%</span>
+        </div>
+        <div id="stream-last" style="font-size:8px;color:var(--text3)"></div>
+      </div>
+
       <!-- Activity Log -->
       <div class="card" style="flex:1">
         <div class="sec-head" style="color:#5865F2">📋 ACTIVITY</div>
@@ -5656,7 +5705,8 @@ hr.div  {
 // ─────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────
-const TABS = ['dash','wfall','sstv','sched','hist','cfg','system','apicfg','ai','trip','clips','specops'];
+// Number keys map indices 0-8 only; the rest are listed so #hash restore on reload works.
+const TABS = ['dash','wfall','sstv','sched','hist','cfg','system','apicfg','ai','trip','clips','specops','sentient','discord','live'];
 
 const CMD_PALETTE = [
   { name:'Connect radio',        key:'C',  action:()=>dashConnect() },
@@ -5715,6 +5765,7 @@ function showTab(name) {
   if (name === 'sched')  { loadSchedule(); loadBeacons(); _loadVoicesInto('bcn-engine','bcn-voice','bcn_voice'); _loadVoicesInto('sched-engine','sched-voice'); }
   if (name === 'wfall')  loadWaterfallCanned();
   if (name === 'cfg')    { loadGongPath(); loadDiscordStatus(); discordStartPolling(); loadCtrlStatus(); ctrlStartPolling(); _loadVoicesInto('alexa-engine','alexa-voice','alexa_voice'); }
+  if (name !== 'cfg')    { discordStopPolling(); ctrlStopPolling(); }
   if (name === 'system') { loadAudioDevices(); loadHealth(); loadGongPath(); }
   if (name === 'apicfg') { loadEngineStatus(); loadLlmProviders(); }
   if (name === 'specops'){ ghostPoll(); specopsRefreshStatus(); _mcStart(); }
@@ -5792,7 +5843,9 @@ function startSSE() {
     try { applyState(JSON.parse(e.data)); } catch {}
   };
   src.onerror = () => {
-    setBadge('cat', 'off', '–', 'err');
+    // (was setBadge(), which doesn't exist -> ReferenceError here meant the
+    // reconnect below never ran and the dashboard froze after a backend restart)
+    setLed('sb-cat-led', 'err'); setText('sb-cat-val', 'ERR', 'err');
     try { src.close(); } catch {}
     if (_sseSource === src) _sseSource = null;
     setTimeout(startSSE, 5000);
@@ -6427,15 +6480,27 @@ async function doPreview() {
 }
 
 async function doPTTOff() {
-  await api('POST','/api/ptt',{state:'off'});
-  setTxState(false);
-  showAlert('dash-alert','PTT OFF','ok');
+  // Always reset the TX UI, even if the request fails -- the radio may already
+  // have dropped PTT and a stuck "TX" indicator is worse than a stale one.
+  try {
+    await api('POST','/api/ptt',{state:false});
+    showAlert('dash-alert','PTT OFF','ok');
+  } catch(e) {
+    showAlert('dash-alert','PTT OFF request failed: ' + e.message,'err');
+  } finally {
+    setTxState(false);
+  }
 }
 
 async function terminateTx() {
-  await api('POST','/api/tx/terminate');
-  setTxState(false);
-  showAlert('dash-alert','TX terminated','warn');
+  try {
+    await api('POST','/api/tx/terminate');
+    showAlert('dash-alert','TX terminated','warn');
+  } catch(e) {
+    showAlert('dash-alert','Terminate request failed: ' + e.message,'err');
+  } finally {
+    setTxState(false);
+  }
 }
 
 function animateTxLevel() {
@@ -9273,7 +9338,8 @@ function vfxReset() {
 }
 
 // ── Live Chat mode ────────────────────────────────────────────
-function txLiveChatToggle() {
+function txLiveChatApplyUI() {
+  // UI-only part (banner/placeholder); safe to call during settings restore
   const on      = document.getElementById('tx-livechat')?.checked;
   const banner  = document.getElementById('tx-livechat-banner');
   const textarea = document.getElementById('tx-text');
@@ -9286,8 +9352,13 @@ function txLiveChatToggle() {
       textarea.placeholder = 'Enter text to transmit over the air...';
       textarea.rows = 4;
     }
-    textarea.focus();
   }
+  return on;
+}
+
+function txLiveChatToggle() {
+  const on = txLiveChatApplyUI();
+  document.getElementById('tx-text')?.focus();
   // Persist IRC mode setting
   api('POST', '/api/settings', { irc_mode: on ? 'true' : 'false' });
 }
@@ -9318,21 +9389,27 @@ function txHandleKey(event) {
 // GONG PATH SETTINGS
 // ─────────────────────────────────────────────────────────────
 async function loadGongPath() {
+  // Called on every CFG/SYSTEM tab visit: refresh the settings cache and the
+  // gong field ONLY. Re-applying every persisted field here (the old
+  // behaviour) silently reverted unsaved edits in other tabs.
   try {
     const r = await api('GET', '/api/settings');
-    // Cache all settings globally so tripInit() and other inits can restore DOM state
     window._appSettings = r || {};
     const inp = document.getElementById('set-gong-path');
     if (inp && r.gong_path) inp.value = r.gong_path;
-    // Restore memory config panel
-    memoryRestoreSettings(r);
-    // Restore Alexa config panel
-    alexaRestoreSettings();
-    // Restore Clips config panel
-    clipsRestoreSettings();
-    // Restore all other persisted fields
-    _restoreAllSettings(r);
   } catch {}
+}
+
+async function restoreAllFromSettings() {
+  // One-time restore of every persisted field, run from init().
+  await loadGongPath();
+  const r = window._appSettings || {};
+  try {
+    memoryRestoreSettings(r);   // Memory config panel
+    alexaRestoreSettings();     // Alexa config panel
+    clipsRestoreSettings();     // Clips config panel
+    _restoreAllSettings(r);     // everything else
+  } catch(e) { console.warn('restoreAllFromSettings', e); }
 }
 
 async function saveGongPath() {
@@ -10620,7 +10697,7 @@ async function cfgFlushPresets() {
     // AI tab
     ai_tx_engine: get('ai-tx-engine'),
     ai_tx_voice:  get('ai-tx-voice'),
-    ai_auto_tx:   checked('ai-auto-tx'),
+    ai_auto_tx:   checked('ai-auto-tx') ? 'true' : 'false',
     // Acid Trip agent A
     trip_a_emoji:    get('trip-a-emoji'),
     trip_a_engine:   get('trip-a-engine'),
@@ -10736,6 +10813,12 @@ async function cfgFlushPresets() {
     sentient_tx_voice:        get('sent-tx-voice'),
     sentient_tx_preset:       get('sent-tx-preset'),
     sentient_handshake:       document.getElementById('sent-handshake')?.checked ? 'true' : 'false',
+    // Browser tab stream (Live tab)
+    stream_token:     get('stream-token'),
+    stream_max_min:   get('stream-max-min'),
+    stream_idle_sec:  get('stream-idle-sec'),
+    stream_vox_sec:   get('stream-vox-sec'),
+    stream_vox_level: get('stream-vox-level'),
     // Memory / Qdrant
     memory_enabled:           document.getElementById('memory-enabled')?.checked ? 'true' : 'false',
     memory_qdrant_host:       document.getElementById('memory-qdrant-host')?.value || '',
@@ -11713,7 +11796,7 @@ function tripClear() {
   await pollStatus();
   await loadDashStats();
   _txFeedLoad();
-  await loadGongPath();   // caches window._appSettings for tripInit and other restores
+  await restoreAllFromSettings();   // caches window._appSettings + restores every persisted field once
   loadVoices();
   vfxPreset('normal');   // set default VFX preset and highlight CLEAN button
   startSSE();
@@ -12578,6 +12661,12 @@ function _restoreAllSettings(s) {
     if (el) el.checked = s.sentient_handshake === 'true';
   }
   sentModeChange();
+  // Browser tab stream (Live tab)
+  set('stream-token',     s.stream_token);
+  set('stream-max-min',   s.stream_max_min);
+  set('stream-idle-sec',  s.stream_idle_sec);
+  set('stream-vox-sec',   s.stream_vox_sec);
+  set('stream-vox-level', s.stream_vox_level);
   // TX tab defaults (engine triggers async voice list load)
   if (s.tx_engine) {
     set('tx-engine', s.tx_engine);
@@ -12591,7 +12680,12 @@ function _restoreAllSettings(s) {
   chk('ai-auto-tx',   s.ai_auto_tx);
   // IRC mode
   chk('tx-livechat',   s.irc_mode);
-  if (s.irc_mode === 'true') txLiveChatToggle();
+  if (s.irc_mode != null) {
+    // Restore the checkbox + UI without focusing a hidden textarea or re-POSTing
+    const cb = document.getElementById('tx-livechat');
+    if (cb) cb.checked = (s.irc_mode === 'true');
+    txLiveChatApplyUI();
+  }
   // Clips gong
   if (s.clips_gong != null) {
     const gEl = document.getElementById('clips-gong');
@@ -13618,6 +13712,72 @@ async function livePollStatus() {
     if (cnt) cnt.textContent = s.event_count || 0;
 
   } catch(e) { /* tab not active or backend issue */ }
+  streamPollStatus();
+}
+
+// ── Browser tab stream (Chrome extension → /api/stream/tx) ──
+let _streamCfgLoaded = false;
+
+async function streamPollStatus() {
+  try {
+    const s = await api('GET', '/api/stream/status');
+    const state = document.getElementById('stream-state');
+    const title = document.getElementById('stream-title');
+    const lvl   = document.getElementById('stream-level');
+    const el    = document.getElementById('stream-elapsed');
+    const btn   = document.getElementById('stream-stop-btn');
+    const last  = document.getElementById('stream-last');
+    if (!state) return;
+    if (!s.available) {
+      state.textContent = 'flask-sock missing'; state.style.color = 'var(--tx)';
+    } else if (s.active) {
+      state.textContent = s.ptt ? '🔴 ON AIR' : (s.vox_hold ? '⏸ VOX hold' : 'connected');
+      state.style.color = s.ptt ? '#ff3366' : 'var(--amber)';
+    } else {
+      state.textContent = 'idle'; state.style.color = 'var(--text3)';
+    }
+    if (title) title.textContent = s.active ? ('▶ ' + (s.title || 'browser tab') + '  (' + (s.client || '') + ')') : '—';
+    if (lvl)   lvl.style.width = (s.active ? Math.min(100, s.level || 0) : 0) + '%';
+    if (el) {
+      const sec = s.active ? (s.seconds || 0) : 0;
+      el.textContent = String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0');
+    }
+    if (btn) btn.disabled = !s.active;
+    if (last) last.textContent = s.last_end ? ('last stream ended: ' + s.last_end) : '';
+    // Settings: fill once from the server so an edit in progress isn't clobbered
+    if (!_streamCfgLoaded && s.config) {
+      const c = s.config;
+      const _set = (id, v) => { const e = document.getElementById(id); if (e && v != null && v !== '') e.value = v; };
+      _set('stream-max-min',   c.stream_max_min);
+      _set('stream-idle-sec',  c.stream_idle_sec);
+      _set('stream-vox-sec',   c.stream_vox_sec);
+      _set('stream-vox-level', c.stream_vox_level);
+      const tok = document.getElementById('stream-token');
+      if (tok && c.stream_token === 'set' && !tok.value) tok.placeholder = 'token set (enter to change)';
+      _streamCfgLoaded = true;
+    }
+  } catch(e) { /* backend issue */ }
+}
+
+async function streamStop() {
+  try {
+    const r = await api('POST', '/api/stream/stop');
+    showAlert('dash-alert', r.message || 'Stream stopped', 'warn');
+  } catch(e) { alert('Error: ' + e.message); }
+  setTimeout(streamPollStatus, 300);
+}
+
+async function streamSaveCfg() {
+  const get = id => document.getElementById(id)?.value ?? '';
+  const patch = {
+    stream_max_min:   get('stream-max-min'),
+    stream_idle_sec:  get('stream-idle-sec'),
+    stream_vox_sec:   get('stream-vox-sec'),
+    stream_vox_level: get('stream-vox-level'),
+  };
+  const tok = get('stream-token');
+  if (tok !== '' || document.getElementById('stream-token')?.placeholder.indexOf('token set') < 0) patch.stream_token = tok;
+  try { await api('POST', '/api/settings', patch); } catch(e) { alert('Save failed: ' + e.message); }
 }
 
 async function dbotPollStatus() {

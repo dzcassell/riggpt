@@ -14,6 +14,7 @@ README.md               Full feature documentation
 api_keys.py             API key manager (not committed — lives on server)
 memory/                 Discord ingestion + Qdrant RAG pipeline
 waterfall_image.py      Waterfall art encoder
+chrome-extension/       MV3 Chrome extension: tab audio → ws /api/stream/tx → aplay + PTT
 CLAUDE.md               This file — read on startup
 ```
 
@@ -26,7 +27,7 @@ CLAUDE.md               This file — read on startup
   - `/home/riggpt/app_settings.json` — all settings
   - `/home/riggpt/api_keys.json` — API credentials
 
-## Current version: v2.13.43
+## Current version: v2.14.0
 
 ## Version sync rule — ALWAYS update all 5 on every version bump
 1. `app.py` docstring header (`RigGPT vX.X.X`)
@@ -57,15 +58,34 @@ journalctl -u riggpt -n 50
 - `app.py` (~360KB): grep only, never full read
 - Both change frequently — always grep for exact text before any edit
 
-## Tab structure (v2.13.43)
+## Tab structure (v2.14.0)
 ```
 CONSOLE(1) WF ART(2) SSTV(3) SCHEDULE(4) LOG(5)
-CONFIG(6) SYSTEM(7) API CFG(8) AI(9)  ACID TRIP(!)  CLIPS(0)  SPEC OPS(#)  SENTIENT(@)  DISCORD(&)
+CONFIG(6) SYSTEM(7) API CFG(8) AI(9)  ACID TRIP(!)  CLIPS(0)  SPEC OPS(#)  SENTIENT(@)  DISCORD(&)  LIVE
 ```
 - Pane IDs: `pane-dash`, `pane-wfall`, `pane-sstv`,
   `pane-sched`, `pane-hist`, `pane-cfg`, `pane-system`, `pane-apicfg`,
-  `pane-ai`, `pane-trip`, `pane-clips`, `pane-specops`, `pane-sentient`, `pane-discord`
-- TABS constant in JS: `['dash','wfall','sstv','sched','hist','cfg','system','apicfg','ai','trip','clips','specops']`
+  `pane-ai`, `pane-trip`, `pane-clips`, `pane-specops`, `pane-sentient`, `pane-discord`, `pane-live`
+- TABS constant in JS: `['dash','wfall','sstv','sched','hist','cfg','system','apicfg','ai','trip','clips','specops','sentient','discord','live']`
+  (number keys use indices 0-8 only; the full list is for `#hash` restore on reload)
+- LIVE tab = roger-beep engine + **BROWSER STREAM** card (status/meter/STOP + token, max-min, idle, VOX settings)
+
+## Browser tab stream (v2.14.0)
+- WebSocket `ws://host:5000/api/stream/tx` via `flask-sock` (gevent worker OK). Handler `_stream_run()`,
+  state `_stream_state` under `_stream_lock`, abort via `_stream_kill()` (called by `/api/stream/stop`,
+  `/api/tx/terminate` and `_heartbeat_kill_all`). Routes: `GET /api/stream/status`, `POST /api/stream/stop`.
+- Protocol: text `{"type":"start",token,rate,channels,title}` → `{"type":"ok"}`; binary Int16LE PCM;
+  server `{"type":"status",seconds,level,ptt}` 1/s; text `{"type":"stop"}`.
+- Holds `_tx_exec_lock` + `_play_file_lock` for the whole stream; pauses `_poller_paused` only around PTT CI-V calls.
+- Settings keys: `stream_token stream_max_min stream_idle_sec stream_vox_sec stream_vox_level` (in `SETTINGS_KEYS`).
+
+## TX safety invariants (v2.14.0 bug sweep)
+- Every path that keys PTT must hold `_tx_exec_lock` (execute, `_beacon_tx_file`, `_clips_play`, EVP, stream).
+  Beacons and scheduled clips go through `_beacon_tx_file()`.
+- `SETTINGS_KEYS` (module-level) is THE whitelist for both `POST /api/settings` and config import.
+- CPU-bound encodes (pysstv, waterfall, whisper) go through `_cpu_offload()` so the single gevent worker keeps serving.
+- Interval jobs use `IntervalTrigger(minutes=n)`, never `*/n` cron (breaks for n >= 60).
+- CI-V levels (0x14) and meters (0x15) are BCD: use `set_level/read_level/read_meter`, never raw hi/lo bytes.
 - TX controls are embedded in `pane-dash` (Console tab), not a separate pane
 - BEACON was merged into SCHEDULE (50/50 split) in v2.13.43
 - `pane-dub` (Trenchtown FX) was removed in v2.12.34; FX/pads live in Clips tab
