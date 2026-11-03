@@ -19,6 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     usbutils \
     libopus0 \
     libffi-dev \
+    libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+# libatomic1: pedalboard_native links libatomic.so.1; without it the FX agent
+# silently falls back to the sox chain ("CPU may not support AVX2" is a red herring).
+RUN true \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Create service user + persistent directories ─────────────

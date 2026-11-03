@@ -13,7 +13,9 @@ services:
     ports: !override        # replace (not merge with) the base file's 5000:5000
       - "5001:5000"
     devices:
-      - /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_IC-7610_22001613_A-if00-port0:/dev/ttyUSB0
+      # Port A (CI-V) is exposed as /dev/ttyIC7610 -- the app's SERIAL_PORT default and
+      # first auto-connect candidate -- so it never picks port B first.
+      - /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_IC-7610_22001613_A-if00-port0:/dev/ttyIC7610
       - /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_IC-7610_22001613_B-if00-port0:/dev/ttyUSB1
       - /dev/snd:/dev/snd
     environment:

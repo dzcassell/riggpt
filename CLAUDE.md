@@ -22,8 +22,9 @@ CLAUDE.md               This file — read on startup
 - **Host:** root@192.168.40.15 (`rtx5070ti`, Debian 13). The IC-7610 USB cable is on this box.
 - **Runs as:** Docker container `riggpt` from `/opt/riggpt` (`docker compose up -d --build`),
   bridge network, **port 5001** on the host (5000 is taken by hermitsdr). UI: http://192.168.40.15:5001
-- **Host specifics:** `docker-compose.override.yml` (committed) — by-id serial mapping → `/dev/ttyUSB0`,
-  `/dev/snd`, `RIGGPT_AUDIO_DEVICE=plughw:CODEC`. Ollama is native on the host (`http://192.168.40.15:11434`), Qdrant in Docker (`:6333`).
+- **Host specifics:** `docker-compose.override.yml` (committed) — CP2102 port A (CI-V) mapped by by-id name
+  → `/dev/ttyIC7610` (the app's first auto-connect candidate), port B → `/dev/ttyUSB1`, `/dev/snd`,
+  `RIGGPT_AUDIO_DEVICE=plughw:CODEC` (ALSA card 3 "CODEC" = Burr-Brown PCM2901). Ollama is native on the host (`http://192.168.40.15:11434`), Qdrant in Docker (`:6333`).
 - **Config files (bind-mounted, never in the image):**
   - `/opt/riggpt/data/config/app_settings.json` — all settings (container sees `/home/riggpt/`)
   - `/opt/riggpt/data/config/api_keys.json` — API credentials
