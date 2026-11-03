@@ -31,7 +31,7 @@ CLAUDE.md               This file — read on startup
   - `/opt/riggpt/data/sounds/` clips, `/opt/riggpt/data/wav_cache/` TX log audio
 - **Old host:** root@radio (192.168.40.10) ran the systemd install (`INSTALL.sh`) up to v2.13.49; no longer the deploy target.
 
-## Current version: v2.14.0
+## Current version: v2.14.1
 
 ## Version sync rule — ALWAYS update all 6 on every version bump
 1. `app.py` docstring header (`RigGPT vX.X.X`)

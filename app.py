@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RigGPT v2.14.0
+RigGPT v2.14.1
 Features: Multi-TTS * Audio Effects * Voice Presets * SSTV * Scheduling
           Transmission Logging * Live Dashboard (SSE) * Beacon Mode
           Roger Beep * Waterfall Image Transmission * AI Integration Framework
@@ -396,7 +396,7 @@ logger.setLevel(getattr(logging, _log_level, logging.DEBUG))
 # -------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------
-VERSION        = 'v2.14.0'
+VERSION        = 'v2.14.1'
 RADIO_MODEL    = 'IC-7610'
 SERIAL_PORT    = '/dev/ttyIC7610'  # udev persistent symlink (falls back to ttyUSB0/1)
 BAUD_RATE      = 57600             # must match CI-V USB Baud Rate in radio SET menu
@@ -2662,6 +2662,18 @@ def _radio_poller():
                         )
                     _err_count += 1
                     state['error'] = 'CI-V no response'
+                    # A port opened while the radio was OFF stays deaf after the
+                    # radio is powered on (seen on the Docker host: raw probes
+                    # answered, the app's handle never did). After ~30 s of
+                    # silence close the port; the "not connected" branch below
+                    # then reopens it with the normal auto-reconnect.
+                    if _err_count >= 15 and _err_count % 15 == 0:
+                        logger.warning('Radio poller: 30s of CI-V silence -- '
+                                       'closing serial port to force a clean reopen')
+                        try:
+                            orchestrator.disconnect()
+                        except Exception as _dc_err:
+                            logger.debug(f'Radio poller: disconnect error: {_dc_err}')
                     with _radio_state_lock:
                         _radio_state.update(state)
                     time_module.sleep(2)   # back off before next poll

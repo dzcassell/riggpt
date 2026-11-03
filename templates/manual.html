@@ -2187,6 +2187,17 @@ systemctl daemon-reload
 
 <div class="cl-entry">
   <div class="cl-header">
+    <span class="cl-ver">v2.14.1</span>
+    <span class="cl-date">2026-11-03</span>
+  </div>
+  <div class="cl-body"><ul>
+    <li><span class="cl-tag fix">fix</span> <strong>Radio powered on after RigGPT</strong> &mdash; a CI-V port opened while the radio was off stayed deaf. The poller now closes the port after ~30 s of silence so auto-reconnect reopens it; no manual DISCONNECT/CONNECT needed.</li>
+    <li><span class="cl-tag new">new</span> <strong>Docker deploy</strong> &mdash; production is the <code>riggpt</code> container on 192.168.40.15:5001 (<code>docker-compose.override.yml</code> maps CI-V port A → <code>/dev/ttyIC7610</code>, USB CODEC, <code>libatomic1</code> for pedalboard, <code>packaging</code> for gunicorn's gevent worker).</li>
+  </ul></div>
+</div>
+
+<div class="cl-entry">
+  <div class="cl-header">
     <span class="cl-ver">v2.14.0</span>
     <span class="cl-date">2026-11-03</span>
   </div>
