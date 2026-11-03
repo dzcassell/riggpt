@@ -1,8 +1,9 @@
-# RigGPT v2.13.49 -- Python Dependencies
+# RigGPT v2.14.0 -- Python Dependencies
 
 # Web framework
 flask>=2.3.0
 flask-cors>=4.0.0
+flask-sock>=0.7.0      # WebSocket for browser tab audio streaming (Chrome extension)
 
 # Production WSGI server
 gunicorn>=21.2.0

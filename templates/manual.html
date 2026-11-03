@@ -407,6 +407,7 @@
   <a href="#tab-clips" class="sub">Clips</a>
   <a href="#tab-sentient" class="sub">SENTIENT</a>
   <a href="#tab-discord" class="sub">Discord Bot</a>
+<a href="#tab-live" class="sub">Live / Browser Stream</a>
   <a href="#prompt-arch">Prompt Architecture</a>
 
   <div class="toc-section">Acid Trip Deep Dive</div>
@@ -1262,6 +1263,31 @@ pip3 install openai-whisper --break-system-packages   # fallback
 <!-- ══════════════════════════════════════════════════════════
      TTS ENGINES
 ══════════════════════════════════════════════════════════ -->
+<h2 id="tab-live"><span class="h2-icon">17b</span> LIVE Tab &mdash; Roger Beeps &amp; Browser Stream</h2>
+
+<p>The LIVE tab has two jobs: a <strong>live engine</strong> that watches CI-V for front-panel PTT and fires roger beeps / jingles / echo tails / robot stingers when you release the mic, and a <strong>BROWSER STREAM</strong> card that lets a Chrome extension transmit the audio of any browser tab (YouTube, etc.) through the radio.</p>
+
+<h3>Live engine</h3>
+<p>Press <strong>▶ START</strong>. The engine polls TX state every 200 ms (75 ms while transmitting) and on the TX→RX edge keys PTT itself, plays the enabled samples and un-keys. Set the IC-7610 MOD source to <code>MIC,USB</code> so samples mix into your TX audio. Samples are generated with sox on first use and cached in the live directory; jingle clips come from <code>/home/riggpt/clips/</code>. VFO WOBBLE modulates frequency during TX &mdash; keep depth/rate low.</p>
+
+<h3>Browser Stream (Chrome extension)</h3>
+<p>Install the extension from <code>chrome-extension/</code> in the repo (<code>chrome://extensions</code> → Developer mode → Load unpacked). In its popup set the RigGPT host (<code>192.168.40.10:5000</code>) and, if you set one here, the token. Open the tab you want to transmit, start playback, click <strong>▶ TRANSMIT THIS TAB</strong>.</p>
+<pre>
+Chrome tab ──tabCapture──▶ AudioWorklet (48 kHz mono Int16 PCM)
+          ──WebSocket ws://host:5000/api/stream/tx──▶ RigGPT
+          ──aplay -t raw (USB codec) + CI-V PTT──▶ IC-7610
+</pre>
+<p>Because the extension captures the <em>tab</em>, whatever you are logged into in Chrome just works. The card shows <strong>🔴 ON AIR</strong>, the tab title and client IP, a level meter, elapsed time and a <strong>■ STOP</strong> button.</p>
+<table>
+<tr><th>Setting</th><th>Default</th><th>Effect</th></tr>
+<tr><td>Token</td><td>blank</td><td>Shared secret the extension must present. Without it anyone on the LAN who can reach port 5000 can key the radio.</td></tr>
+<tr><td>Max TX</td><td>30 min</td><td>Hard limit per stream. PTT drops and the stream ends.</td></tr>
+<tr><td>Idle</td><td>5 s</td><td>No audio frames from the browser for this long → stream ends, PTT drops.</td></tr>
+<tr><td>VOX drop / below</td><td>4 s / 2 %</td><td>Peak level under the threshold for this long → PTT released (paused video ≠ dead carrier). Re-keys as soon as audio returns. <code>0</code> disables.</td></tr>
+</table>
+<p>PTT also drops when the WebSocket closes, the tab is closed, <code>aplay</code> exits, on <strong>PTT OFF</strong> / <strong>TERM TX</strong> / <code>Ctrl+.</code>, and on the dead-man heartbeat. The stream holds the same TX lock as TTS, clips and beacons, so it is refused while another transmission is on the air and nothing else can key over it. Every stream is logged to the transmission log as <code>[browser stream] &lt;tab title&gt;</code>.</p>
+<p><strong>Regulatory:</strong> you are the control operator. Music and rebroadcast of third-party audio are restricted on amateur frequencies; keep Auto-ID running during long streams.</p>
+
 <h2 id="tts-espeak"><span class="h2-icon">18</span> TTS: eSpeak</h2>
 <p>Offline, zero-latency. Robotic character that works well for non-human personas. No API key required.</p>
 <p>Voices follow eSpeak voice string format: <code>en-us</code>, <code>en-gb</code>, <code>en-us+m3</code>, <code>en-us+f3</code>, etc. The <code>+m</code> and <code>+f</code> suffixes select male/female variants.</p>
@@ -2158,6 +2184,24 @@ systemctl daemon-reload
      CHANGELOG
 ══════════════════════════════════════════════════════════ -->
 <h2 id="changelog"><span class="h2-icon">40</span> Changelog</h2>
+
+<div class="cl-entry">
+  <div class="cl-header">
+    <span class="cl-ver">v2.14.0</span>
+    <span class="cl-date">2026-11-03</span>
+  </div>
+  <div class="cl-body"><ul>
+    <li><span class="cl-tag new">new</span> <strong>Browser tab stream</strong> &mdash; Chrome extension (<code>chrome-extension/</code>) captures a tab's audio (YouTube etc.) and streams PCM over WebSocket to <code>/api/stream/tx</code>; RigGPT keys PTT and plays it on the USB codec. BROWSER STREAM card in the LIVE tab with meter, STOP, token, max-minutes, idle and VOX settings. Requires <code>flask-sock</code> (installed by INSTALL.sh).</li>
+    <li><span class="cl-tag fix">fix</span> <strong>Emergency PTT OFF keyed the transmitter</strong> &mdash; <code>/api/ptt</code> did <code>bool('off')</code>. Accepts true/false/on/off now; the UI sends a boolean and resets its TX state even if the request fails.</li>
+    <li><span class="cl-tag fix">fix</span> <strong>PTT safety</strong> &mdash; beacons, scheduled clips, clips, EVP and the PTT test all go through the TX lock / poller pause / killable-aplay path; a clip interrupted by a newer clip no longer un-keys the radio under it; mystery TX uses the clips state; hung <code>aplay</code> is actually killed on timeout; <code>play_file</code> is killable by TERM TX.</li>
+    <li><span class="cl-tag fix">fix</span> <strong>CI-V BCD</strong> &mdash; ATT set/read, ALC and PO meters, RF POWER WOBBLE (was sending binary hi/lo bytes), waterfall power restore (read the power setting, not a non-existent meter; original mode is restored too).</li>
+    <li><span class="cl-tag fix">fix</span> <strong>Discord</strong> &mdash; bot no longer replays buffered history (incl. <code>say</code> commands) on restart, nor re-processes messages when the seen-set was randomly trimmed; pollers survive bad payloads; voice re-join no longer kills the new ffmpeg; ffmpeg stderr can't block the stream.</li>
+    <li><span class="cl-tag fix">fix</span> <strong>Config export/import</strong> &mdash; import used a stale whitelist and silently dropped most settings; schedules carried no cron/text and never restored; booleans were stored un-normalised. One shared <code>SETTINGS_KEYS</code> whitelist now.</li>
+    <li><span class="cl-tag fix">fix</span> <strong>UI</strong> &mdash; dashboard SSE reconnect threw <code>ReferenceError</code> (frozen dashboard after a backend restart); visiting CFG/SYSTEM reverted unsaved edits in other tabs and stole focus; Discord/control pollers now stop when leaving CFG; <code>#sentient/#discord/#live</code> hash restore on reload; duplicate alert-strip id; <code>/api/clips/status</code> had no route.</li>
+    <li><span class="cl-tag chg">chg</span> <strong>Performance</strong> &mdash; SSTV/waterfall encodes and Whisper run in a real thread so the single gevent worker keeps serving; <code>/api/system/health</code> caches dependency probes (was spawning 11 processes every 10 s); numpy level metering for Discord voice; interval jobs use <code>IntervalTrigger</code> (<code>*/n</code> cron broke for n ≥ 60).</li>
+    <li><span class="cl-tag fix">fix</span> Temp-file leaks (EVP, SENTIENT handshake TX, CW beacon, aplay timeout), sqlite handles closed on error, <code>pkill -f aplay</code> removed from clips stop (it killed every other player), path traversal closed for beacon/scheduled clips and live samples, heartbeat watchdog no longer duplicates.</li>
+  </ul></div>
+</div>
 
 <div class="cl-entry">
   <div class="cl-header">

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RigGPT v2.13.49
+RigGPT v2.14.0
 Features: Multi-TTS * Audio Effects * Voice Presets * SSTV * Scheduling
           Transmission Logging * Live Dashboard (SSE) * Beacon Mode
           Roger Beep * Waterfall Image Transmission * AI Integration Framework
@@ -358,6 +358,7 @@ _clips_files: list = []      # [{name, path, size, ext, source, cached_path}]
 _clips_last_scan: str = ''   # ISO timestamp of last scan
 _clips_playing: bool = False # True while a clip TX is in progress
 _clips_proc = None           # Popen handle for the running player process
+_clips_gen  = 0              # bumped per play; a superseded _clips_play must not touch PTT/state
 _clips_s3_cache_dir = '/tmp/riggpt_clips_cache'
 
 # ── Special Ops state ───────────────────────────────────────────
@@ -395,7 +396,7 @@ logger.setLevel(getattr(logging, _log_level, logging.DEBUG))
 # -------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------
-VERSION        = 'v2.13.49'
+VERSION        = 'v2.14.0'
 RADIO_MODEL    = 'IC-7610'
 SERIAL_PORT    = '/dev/ttyIC7610'  # udev persistent symlink (falls back to ttyUSB0/1)
 BAUD_RATE      = 57600             # must match CI-V USB Baud Rate in radio SET menu
@@ -588,6 +589,24 @@ DEFAULT_PIPER_VOICE = 'en_US-amy-medium'
 app = Flask(__name__)
 CORS(app)
 
+
+def _cpu_offload(fn, *args, **kwargs):
+    """Run CPU-bound pure-compute work (pysstv encode, waterfall synthesis,
+    whisper transcription) in a real OS thread via gevent's threadpool.
+
+    Under gunicorn's single gevent worker a `threading.Thread` is a greenlet,
+    so a 30 s SSTV encode froze every HTTP request, the SSE poller, the Live
+    engine and the heartbeat watchdog (which then killed PTT mid-TX).
+    Falls back to a direct call when not running under gevent. Only use for
+    code that does no gevent-patched I/O (no sockets/subprocess/sleep)."""
+    try:
+        if 'gevent' in sys.modules:
+            from gevent import get_hub
+            return get_hub().threadpool.apply(fn, args, kwargs)
+    except Exception as e:
+        logger.debug(f'_cpu_offload: threadpool unavailable ({e}), running inline')
+    return fn(*args, **kwargs)
+
 # -------------------------------------------------------------
 # Database
 # -------------------------------------------------------------
@@ -649,28 +668,25 @@ def init_db():
 
 def log_event(level, category, message):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute('INSERT INTO system_events (timestamp,level,category,message) VALUES (?,?,?,?)',
-                     (_now_utc(), level, category, message))
-        conn.execute('DELETE FROM system_events WHERE id NOT IN (SELECT id FROM system_events ORDER BY id DESC LIMIT 500)')
-        conn.commit(); conn.close()
+        with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+            conn.execute('INSERT INTO system_events (timestamp,level,category,message) VALUES (?,?,?,?)',
+                         (_now_utc(), level, category, message))
+            conn.execute('DELETE FROM system_events WHERE id NOT IN (SELECT id FROM system_events ORDER BY id DESC LIMIT 500)')
     except Exception:
         pass
 
 def log_transmission(message, engine, voice, preset, duration, success, notes='',
                      frequency=None, mode=None, wav_path=None):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            'INSERT INTO transmissions '
-            '(timestamp,message,engine,voice,preset,duration,success,notes,frequency,mode,char_count,wav_cached) '
-            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-            (_now_utc(), message, engine, voice or '', preset or '', duration, int(success), notes,
-             frequency, mode, len(message) if message else 0, 1 if wav_path else 0)
-        )
-        tx_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+            cur = conn.execute(
+                'INSERT INTO transmissions '
+                '(timestamp,message,engine,voice,preset,duration,success,notes,frequency,mode,char_count,wav_cached) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                (_now_utc(), message, engine, voice or '', preset or '', duration, int(success), notes,
+                 frequency, mode, len(message) if message else 0, 1 if wav_path else 0)
+            )
+            tx_id = cur.lastrowid
         # Cache the wav file if provided
         if wav_path and os.path.exists(wav_path):
             try:
@@ -1027,13 +1043,17 @@ class IcomSerialAgent:
             data = list(resp)
             for i in range(len(data) - 4):
                 if data[i] == 0xFE and data[i+1] == 0xFE and data[i+4] == 0x15:
-                    return (data[i+6] << 8) | data[i+7]
+                    # 4-digit BCD (0000-0255), same as read_meter
+                    return (((data[i+6] >> 4) * 10 + (data[i+6] & 0x0F)) * 100
+                            + (data[i+7] >> 4) * 10 + (data[i+7] & 0x0F))
         except Exception:
             pass
         return None
 
     def read_rf_power(self):
-        """Read RF power output level (cmd 0x15 0x11). Returns 0-255."""
+        """Read RF power output METER (cmd 0x15 0x11). Returns 0-255 BCD-decoded.
+        Note: this is the live PO meter, not the power setting -- use
+        read_level(0x0A) for the setting."""
         resp = self.send_command(0x15, 0x11, quiet=True)
         if not resp:
             return None
@@ -1041,7 +1061,8 @@ class IcomSerialAgent:
             data = list(resp)
             for i in range(len(data) - 4):
                 if data[i] == 0xFE and data[i+1] == 0xFE and data[i+4] == 0x15:
-                    return (data[i+6] << 8) | data[i+7]
+                    return (((data[i+6] >> 4) * 10 + (data[i+6] & 0x0F)) * 100
+                            + (data[i+7] >> 4) * 10 + (data[i+7] & 0x0F))
         except Exception:
             pass
         return None
@@ -1168,13 +1189,16 @@ class IcomSerialAgent:
             data = list(resp)
             for i in range(len(data)-2):
                 if data[i]==0xFE and data[i+1]==0xFE and data[i+4]==0x11:
-                    return data[i+5]  # 0=off, 6=6dB, 12=12dB, 18=18dB
+                    b = data[i+5]  # BCD: 0x00=off, 0x06, 0x12=12dB, 0x18=18dB
+                    return (b >> 4) * 10 + (b & 0x0F)
         except Exception: pass
         return 0
 
     def set_att(self, level):
-        """Set ATT: 0=off, 6=6dB, 12=12dB, 18=18dB."""
-        resp = self.send_command(0x11, level)
+        """Set ATT: 0=off, 6=6dB, 12=12dB, 18=18dB (sent as BCD, 0x12 = 12 dB)."""
+        level = int(level)
+        bcd = ((level // 10) << 4) | (level % 10)
+        resp = self.send_command(0x11, bcd)
         return resp is not None and 0xFB in resp
 
     def read_preamp(self):
@@ -2241,10 +2265,18 @@ class AudioPlaybackAgent:
                     logger.warning(f"aplay failed device={dev}: rc={proc.returncode} {err}")
                     break  # move to next device
                 except subprocess.TimeoutExpired:
-                    if _active_tx_proc:
-                        _active_tx_proc.kill()
-                        _active_tx_proc = None
+                    # The inner finally already cleared _active_tx_proc, so kill
+                    # the local handle -- otherwise a hung aplay keeps the ALSA
+                    # device open and every later TX fails with "busy".
+                    try:
+                        proc.kill(); proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    _active_tx_proc = None
                     logger.error("aplay timed out")
+                    if processed and processed != file_path and os.path.exists(processed):
+                        try: os.remove(processed)
+                        except Exception: pass
                     return False
                 except Exception as e:
                     _active_tx_proc = None
@@ -2818,6 +2850,7 @@ def _run_beacon_clip(bid, cfg):
     if not sound_file:
         logger.error(f'Beacon {bid}: no sound_file configured')
         return
+    sound_file = os.path.basename(sound_file)   # confine to the clips dir
     clips_dir  = _clips_cfg().get('dir', CLIPS_DEFAULT_DIR)
     local_path = os.path.join(clips_dir, sound_file)
     s3_cache   = '/tmp/riggpt_clips_cache'
@@ -2827,20 +2860,47 @@ def _run_beacon_clip(bid, cfg):
     if not path:
         logger.error(f'Beacon {bid}: clip not found: {sound_file}')
         return
+    _beacon_tx_file(bid, path, f'clip played: {sound_file}')
+
+
+def _beacon_tx_file(bid, path, done_msg):
+    """Key PTT and play a WAV for a beacon under the same guards execute()
+    uses (TX lock, poller pause, killable aplay), so a beacon can never fire
+    into the middle of another transmission or leave PTT keyed."""
+    global _poller_paused, _active_tx_proc
+    if not _tx_exec_lock.acquire(timeout=60):
+        logger.warning(f'Beacon {bid}: TX busy for 60s, skipping this run')
+        return
+    ptt_active = False
+    proc = None
     try:
         ptt_agent = orchestrator.icom_agent
         if orchestrator._connected:
+            _poller_paused = True
+            time_module.sleep(0.1)
             ptt_agent.ptt_on()
+            ptt_active = True
+            time_module.sleep(0.3)
         dev = AUDIO_DEVICE or 'default'
-        import subprocess
-        subprocess.run(['aplay', '-D', dev, path], timeout=300, capture_output=True)
-        if orchestrator._connected:
-            ptt_agent.ptt_off()
-        logger.info(f'Beacon {bid}: clip played: {sound_file}')
+        proc = subprocess.Popen(['aplay', '-q', '-D', dev, path],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _active_tx_proc = proc
+        try:
+            proc.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill(); proc.wait(timeout=5)
+            logger.warning(f'Beacon {bid}: aplay timed out')
+        logger.info(f'Beacon {bid}: {done_msg}')
     except Exception as e:
-        logger.error(f'Beacon {bid} clip error: {e}')
-        try: orchestrator.icom_agent.ptt_off()
-        except Exception: pass
+        logger.error(f'Beacon {bid} TX error: {e}')
+    finally:
+        if _active_tx_proc is proc:
+            _active_tx_proc = None
+        if ptt_active:
+            try: orchestrator.icom_agent.ptt_off()
+            except Exception: pass
+        _poller_paused = False
+        _tx_exec_lock.release()
 
 
 def _run_beacon_cw(bid, cfg):
@@ -2851,28 +2911,20 @@ def _run_beacon_cw(bid, cfg):
     callsign = cfg.get('callsign', '').strip().upper()
     if callsign:
         text = f'{text} DE {callsign} AR'
+    wav_path = None
     try:
         wav_bytes = _cw_synthesize(text, wpm=wpm)
         _fd, wav_path = tempfile.mkstemp(suffix='_cw.wav')
         os.close(_fd)
         with open(wav_path, 'wb') as f:
             f.write(wav_bytes)
-        ptt_agent = orchestrator.icom_agent
-        if orchestrator._connected:
-            ptt_agent.ptt_on()
-        import subprocess
-        dev = AUDIO_DEVICE or 'default'
-        subprocess.run(['aplay', '-D', dev, wav_path],
-                       timeout=300, capture_output=True)
-        if orchestrator._connected:
-            ptt_agent.ptt_off()
+        _beacon_tx_file(bid, wav_path, f'CW sent ({wpm} wpm)')
     except Exception as e:
         logger.error(f'CW beacon {bid} error: {e}')
-        try: orchestrator.icom_agent.ptt_off()
-        except Exception: pass
     finally:
-        try: os.unlink(wav_path)
-        except Exception: pass
+        if wav_path:
+            try: os.unlink(wav_path)
+            except Exception: pass
 
 
 def _run_beacon(bid):
@@ -3019,7 +3071,10 @@ def api_transmit():
 
 @app.route('/api/ptt', methods=['POST'])
 def api_ptt():
-    state = bool((request.json or {}).get('state', False))
+    # Accept true/false, 'on'/'off', 1/0. bool('off') is True, which used to
+    # make the emergency PTT OFF button key the transmitter.
+    raw = (request.json or {}).get('state', False)
+    state = raw if isinstance(raw, bool) else str(raw).strip().lower() in ('1', 'true', 'on')
     agent = orchestrator.icom_agent
     if not agent.serial_conn or not agent.serial_conn.is_open:
         return jsonify({'success': False, 'ptt': state,
@@ -3065,8 +3120,25 @@ def api_schedule_list():
             'trigger':   trigger_str,
             'enabled':   j.next_run_time is not None,
             'run_count': getattr(j, 'run_count', 0),
+            'meta':      getattr(j, 'meta', {}) or {},   # text/cron/engine for export
         })
     return jsonify({'jobs': jobs})
+
+
+def _sched_job_body(j):
+    """Turn an exported schedule entry (api_schedule_list row) back into the
+    POST body api_schedule_add expects. Before this, export carried no cron
+    or text, so import rejected the first entry and skipped the rest."""
+    m = j.get('meta') or {}
+    sound_file = m.get('sound_file') or j.get('sound_file', '')
+    return {
+        'cron':       m.get('cron') or j.get('cron', '') or j.get('cron_expression', ''),
+        'text':       '' if sound_file else (m.get('text') or j.get('text', '') or j.get('message', '')),
+        'sound_file': sound_file,
+        'engine':     (m.get('engine') if m.get('engine') not in (None, '', 'clip') else 'piper'),
+        'voice':      m.get('voice'),
+        'preset':     m.get('preset', 'normal'),
+    }
 
 
 @app.route('/api/schedule', methods=['POST'])
@@ -3086,8 +3158,8 @@ def api_schedule_add():
         voice  = data.get('voice')
         preset = data.get('preset', 'normal')
         if sound_file:
-            def _play_clip(sf=sound_file):
-                """Play a Clips sound file over the air."""
+            def _play_clip(sf=os.path.basename(sound_file)):
+                """Play a Clips sound file over the air (confined to the clips dir)."""
                 cfg = _clips_cfg()
                 clips_dir = cfg.get('dir', CLIPS_DEFAULT_DIR)
                 local_path = os.path.join(clips_dir, sf)
@@ -3098,19 +3170,8 @@ def api_schedule_add():
                 if not path:
                     logger.error(f'Schedule clip not found: {sf}')
                     return
-                try:
-                    ptt_agent = orchestrator.icom_agent
-                    if orchestrator._connected:
-                        ptt_agent.ptt_on()
-                    import subprocess
-                    dev = AUDIO_DEVICE or 'default'
-                    subprocess.run(['aplay', '-D', dev, path], timeout=300, capture_output=True)
-                    if orchestrator._connected:
-                        ptt_agent.ptt_off()
-                except Exception as e:
-                    logger.error(f'Schedule clip play error: {e}')
-                    try: orchestrator.icom_agent.ptt_off()
-                    except Exception: pass
+                # Same TX-lock / poller-pause / PTT-safe path as beacons
+                _beacon_tx_file('sched', path, f'scheduled clip played: {sf}')
             job = scheduler.add_job(
                 _play_clip,
                 CronTrigger.from_crontab(cron),
@@ -3124,8 +3185,9 @@ def api_schedule_add():
                 id=f'sched_{int(time_module.time())}'
             )
             label = text
-        # Store metadata for display
+        # Store metadata for display AND for config export/import round-trip
         job.meta = {'text': label, 'engine': engine if not sound_file else 'clip',
+                    'voice': voice, 'preset': preset,
                     'sound_file': sound_file, 'cron': cron}
         return jsonify({'success': True, 'job_id': job.id, 'label': label})
     except Exception as e:
@@ -3147,7 +3209,7 @@ def api_sstv():
     request.files['image'].save(img_path)
     ptt_active = False
     try:
-        if not image_to_sstv(img_path, wav_path, mode, vox=vox,
+        if not _cpu_offload(image_to_sstv, img_path, wav_path, mode, vox=vox,
                               fskid=fskid, keep_aspect=keep_aspect):
             return jsonify({'success': False, 'message': 'SSTV encoding failed'}), 500
         meta = SSTV_MODE_META.get(mode, {})
@@ -3195,7 +3257,7 @@ def api_sstv_encode():
     os.close(_fd)
     request.files['image'].save(img_path)
     try:
-        if not image_to_sstv(img_path, wav_path, mode, vox=vox,
+        if not _cpu_offload(image_to_sstv, img_path, wav_path, mode, vox=vox,
                               fskid=fskid, keep_aspect=keep_aspect):
             return jsonify({'success': False, 'message': 'SSTV encoding failed'}), 500
         import base64
@@ -3319,7 +3381,7 @@ def api_beacon_create():
     }
     try:
         job = scheduler.add_job(
-            _run_beacon, CronTrigger.from_crontab(f'*/{minutes} * * * *'),
+            _run_beacon, IntervalTrigger(minutes=minutes),
             args=[bid], id=bid, replace_existing=True,
         )
     except Exception as e:
@@ -3523,6 +3585,7 @@ def api_waterfall_advanced():
         return jsonify({'success': False, 'message': 'Radio not connected'}), 503
 
     orig_freq = agent.read_frequency()
+    orig_mode = agent.read_mode()   # mirror/mode_glitch switch modes; restore what the op had
     _fd, img_path = tempfile.mkstemp(suffix='.png')
     os.close(_fd)
 
@@ -3683,15 +3746,17 @@ def api_waterfall_advanced():
         # ── Execute CI-V choreography ─────────────────────────────────
         ptt_active = False
         t0 = time_module.time()
+        # Init before the try so the finally below can't hit UnboundLocalError
+        # if ptt_on() raises (which would mask the real serial error).
+        last_freq = None
+        last_mode = None
+        last_power = None
+        orig_power = None
         try:
             agent.ptt_on()
             ptt_active = True
             time_module.sleep(0.15)
 
-            last_freq = None
-            last_mode = None
-            last_power = None
-            orig_power = None
             for chunk_idx, (r_start, r_end, freq_hz, mode_name, power_val) in enumerate(chunks):
                 if freq_hz != last_freq:
                     agent.set_frequency(freq_hz)
@@ -3703,8 +3768,9 @@ def api_waterfall_advanced():
                     time_module.sleep(0.02)
                 if power_val is not None and power_val != last_power:
                     if orig_power is None:
-                        # Save original power on first change
-                        orig_power = agent.read_meter(0x0A) or 200
+                        # Save the power SETTING (0x14 0x0A), not a meter. 0x15 0x0A
+                        # is not a valid meter and always returned None -> 200.
+                        orig_power = agent.read_level(0x0A)
                     agent.set_level(0x0A, power_val)
                     last_power = power_val
 
@@ -3740,7 +3806,7 @@ def api_waterfall_advanced():
             if orig_power is not None:
                 try: agent.set_level(0x0A, orig_power)
                 except Exception: pass
-            try: agent.set_mode('USB')
+            try: agent.set_mode(orig_mode or 'USB')
             except Exception: pass
 
         duration = round(time_module.time() - t0, 1)
@@ -3757,7 +3823,7 @@ def api_waterfall_advanced():
         logger.error(f'WF advanced error: {e}', exc_info=True)
         try:
             if orig_freq: agent.set_frequency(orig_freq)
-            agent.set_mode('USB')
+            agent.set_mode(orig_mode or 'USB')
             agent.ptt_off()
         except Exception: pass
         return jsonify({'success': False, 'message': str(e)}), 500
@@ -3814,7 +3880,7 @@ def api_waterfall_transmit():
             request.files['image'].save(img_path)
 
         t0 = time_module.time()
-        wav_path = image_to_waterfall_wav(
+        wav_path = _cpu_offload(image_to_waterfall_wav,
             img_path, wav_path,
             image_width=image_width, image_height=image_height,
             base_freq=base_freq, bandwidth=bandwidth,
@@ -3974,9 +4040,12 @@ def api_radio_ptt_test():
             }), 400
 
     def _do_ptt():
-        agent.ptt_on()
-        time_module.sleep(duration)
-        agent.ptt_off()
+        try:
+            agent.ptt_on()
+            time_module.sleep(duration)
+        finally:
+            try: agent.ptt_off()
+            except Exception: pass
     threading.Thread(target=_do_ptt, daemon=True, name='ptt-test').start()
     port_name = agent.port or SERIAL_PORT
     return jsonify({'success': True,
@@ -4601,6 +4670,11 @@ def api_tx_terminate():
             logger.info('TX terminated by user (aplay SIGTERM)')
         except Exception as e:
             logger.warning(f'Terminate aplay error: {e}')
+    # Browser tab stream, if one is on the air
+    try:
+        _stream_kill()
+    except Exception:
+        pass
     # Also drop PTT regardless
     try:
         if orchestrator.icom_agent and orchestrator.icom_agent.serial_conn \
@@ -4657,6 +4731,11 @@ def _heartbeat_kill_all():
         _voice_stop_client()
     except Exception:
         pass
+    # Stop browser tab stream
+    try:
+        _stream_kill()
+    except Exception:
+        pass
     # Clear global job refs
     global _numbers_station_job, _pirate_job, _mystery_job
     global _autoid_job, _timeannounce_job, _evp_job, _whisper_job
@@ -4676,6 +4755,10 @@ def _heartbeat_watchdog_loop():
     while _heartbeat_active:
         time_module.sleep(10)
         if not _heartbeat_active:
+            break
+        # A disconnect followed by a reconnect inside our 10s sleep registers a
+        # new watchdog; the superseded thread must exit instead of doubling up.
+        if _heartbeat_watchdog is not threading.current_thread():
             break
         if _heartbeat_last == 0:
             continue  # no heartbeat received yet — don't trigger
@@ -4777,6 +4860,7 @@ def api_audio_play_file():
         return jsonify({'success': True, 'message': 'Already playing'}), 200
 
     def _play():
+        global _active_tx_proc
         ptt_active = False
         proc = None
         try:
@@ -4791,7 +4875,10 @@ def api_audio_play_file():
                 # LOW-LATENCY STRATEGY: start aplay first (it initializes ALSA
                 # and buffers audio), then key PTT. By the time PTT settles,
                 # aplay is ready to output immediately.
-                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                # stderr -> DEVNULL: an undrained PIPE let ALSA underrun spam
+                # block aplay, which held PTT for the full 30 s timeout.
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _active_tx_proc = proc   # so TERM TX / heartbeat can kill it
                 time_module.sleep(0.02)  # 20ms: let aplay open ALSA device
                 try:
                     orchestrator.icom_agent.ptt_on()
@@ -4812,11 +4899,13 @@ def api_audio_play_file():
         except subprocess.TimeoutExpired:
             logger.warning('play_file: aplay timed out')
             if proc:
-                try: proc.kill()
+                try: proc.kill(); proc.wait(timeout=2)   # wait() -> no zombie
                 except Exception: pass
         except Exception as e:
             logger.warning(f'play_file: error: {e}')
         finally:
+            if _active_tx_proc is proc:
+                _active_tx_proc = None
             if ptt_active:
                 time_module.sleep(0.05)
                 try: orchestrator.icom_agent.ptt_off()
@@ -4840,72 +4929,7 @@ def api_settings_post():
     """Update application settings. Merges patch into current settings."""
     global _app_settings
     patch = request.json or {}
-    # Allowed setting keys (whitelist to avoid arbitrary writes)
-    allowed = {
-        'gong_path', 'heartbeat_enabled', 'ollama_url', 'ollama_model', 'ollama_enabled',
-        'ai_persona', 'ai_temp', 'ai_max_tokens', 'ai_mode',
-        'serial_port', 'baud_rate', 'ci_v_address',
-        'radio_model',
-        # AI tab TX voice
-        'ai_tx_engine', 'ai_tx_voice', 'ai_auto_tx',
-        # Acid Trip agent presets
-        'trip_a_emoji', 'trip_a_engine', 'trip_a_voice',
-        'trip_a_provider', 'trip_a_model', 'trip_a_model_sel',
-        'trip_a_persona', 'trip_a_canon', 'trip_a_seed',
-        'trip_b_emoji', 'trip_b_engine', 'trip_b_voice',
-        'trip_b_provider', 'trip_b_model', 'trip_b_model_sel',
-        'trip_b_persona', 'trip_b_canon', 'trip_b_seed',
-        'trip_turns', 'trip_delay', 'trip_max_tok', 'trip_temp',
-        # Conversational spacing
-        'trip_gap_min', 'trip_gap_max', 'trip_hesitate',
-        'trip_wildcard', 'trip_wildcard_n', 'trip_tx',
-        'trip_discord_influence', 'trip_discord_lookback', 'trip_discord_lookback_every',
-        'trip_a_fx_preset', 'trip_a_fx_pitch', 'trip_a_fx_reverb', 'trip_a_fx_echo', 'trip_a_fx_intensity',
-        'trip_b_fx_preset', 'trip_b_fx_pitch', 'trip_b_fx_reverb', 'trip_b_fx_echo', 'trip_b_fx_intensity',
-        'trip_topic',
-        # Transmit tab defaults
-        'tx_engine', 'tx_voice', 'tx_delay', 'tx_repeat',
-        # Memory / Qdrant
-        'memory_enabled', 'memory_qdrant_host', 'memory_embed_model',
-        # Alexa mode
-        'alexa_enabled', 'alexa_engine', 'alexa_voice',
-        'alexa_model', 'alexa_trigger', 'alexa_max_tok',
-        # Clips / Media Player
-        'clips_dir', 'clips_poll_interval', 'clips_gong',
-        'clips_s3_enabled', 'clips_s3_bucket',
-        'clips_s3_region', 'clips_s3_prefix',
-        # Discord monitor
-        'discord_inject_target', 'discord_inject_format',
-        # Audio device
-        'audio_device',
-        # Waterfall ART
-        'wf_bw', 'wf_sideband', 'wf_contrast', 'wf_speed_preset', 'wf_frame_ms',
-        # SSTV
-        'sstv_vox',
-        # Beacon form defaults
-        'bcn_interval', 'bcn_repeat', 'bcn_engine', 'bcn_voice',
-        # Special Ops
-        'numbers_station_interval', 'numbers_station_engine', 'numbers_station_voice',
-        'numbers_station_cadence',
-        'solar_autotx_enabled', 'solar_kindex_threshold', 'solar_engine', 'solar_voice',
-        'mystery_window_start', 'mystery_window_end', 'mystery_engine', 'mystery_voice',
-        'autoid_callsign', 'autoid_interval', 'autoid_engine', 'autoid_voice',
-        'timeannounce_interval', 'timeannounce_engine', 'timeannounce_voice',
-        'evp_interval', 'evp_engine', 'evp_voice',
-        'whisper_interval', 'whisper_engine', 'whisper_voice',
-        # Sentient Radio
-        'sentient_audio_in', 'sentient_whisper_model', 'sentient_silence_sec',
-        'sentient_energy', 'sentient_mode', 'sentient_trigger',
-        'sentient_ai_model', 'sentient_persona', 'sentient_temp',
-        'sentient_tx_engine', 'sentient_tx_voice', 'sentient_tx_preset',
-        'sentient_handshake',
-        # Pirate Broadcast
-        'pirate_interval', 'pirate_engine', 'pirate_voice',
-        # Ghost audio
-        'ghost_engine', 'ghost_voice',
-        # IRC mode
-        'irc_mode',
-    }
+    allowed = SETTINGS_KEYS
     updated = {}
     with _app_settings_lock:
         for k, v in patch.items():
@@ -4916,6 +4940,79 @@ def api_settings_post():
             _save_app_settings(_app_settings)
             log_event('INFO', 'SETTINGS', f'Updated settings: {list(updated.keys())}')
     return jsonify({'success': True, 'updated': updated, 'settings': _app_settings})
+
+
+# Allowed setting keys (whitelist to avoid arbitrary writes). Shared by
+# POST /api/settings and config import so an exported backup round-trips
+# every key instead of silently skipping the ones added after v2.11.
+SETTINGS_KEYS = {
+    'gong_path', 'heartbeat_enabled', 'ollama_url', 'ollama_model', 'ollama_enabled',
+    'ai_persona', 'ai_temp', 'ai_max_tokens', 'ai_mode',
+    'serial_port', 'baud_rate', 'ci_v_address',
+    'radio_model',
+    # AI tab TX voice
+    'ai_tx_engine', 'ai_tx_voice', 'ai_auto_tx',
+    # Acid Trip agent presets
+    'trip_a_emoji', 'trip_a_engine', 'trip_a_voice',
+    'trip_a_provider', 'trip_a_model', 'trip_a_model_sel',
+    'trip_a_persona', 'trip_a_canon', 'trip_a_seed',
+    'trip_b_emoji', 'trip_b_engine', 'trip_b_voice',
+    'trip_b_provider', 'trip_b_model', 'trip_b_model_sel',
+    'trip_b_persona', 'trip_b_canon', 'trip_b_seed',
+    'trip_turns', 'trip_delay', 'trip_max_tok', 'trip_temp',
+    # Conversational spacing
+    'trip_gap_min', 'trip_gap_max', 'trip_hesitate',
+    'trip_wildcard', 'trip_wildcard_n', 'trip_tx',
+    'trip_discord_influence', 'trip_discord_lookback', 'trip_discord_lookback_every',
+    'trip_a_fx_preset', 'trip_a_fx_pitch', 'trip_a_fx_reverb', 'trip_a_fx_echo', 'trip_a_fx_intensity',
+    'trip_b_fx_preset', 'trip_b_fx_pitch', 'trip_b_fx_reverb', 'trip_b_fx_echo', 'trip_b_fx_intensity',
+    'trip_topic',
+    # Transmit tab defaults
+    'tx_engine', 'tx_voice', 'tx_delay', 'tx_repeat',
+    # Memory / Qdrant
+    'memory_enabled', 'memory_qdrant_host', 'memory_embed_model',
+    # Alexa mode
+    'alexa_enabled', 'alexa_engine', 'alexa_voice',
+    'alexa_model', 'alexa_trigger', 'alexa_max_tok',
+    # Clips / Media Player
+    'clips_dir', 'clips_poll_interval', 'clips_gong',
+    'clips_s3_enabled', 'clips_s3_bucket',
+    'clips_s3_region', 'clips_s3_prefix',
+    # Discord monitor
+    'discord_inject_target', 'discord_inject_format',
+    # Audio device
+    'audio_device',
+    # Waterfall ART
+    'wf_bw', 'wf_sideband', 'wf_contrast', 'wf_speed_preset', 'wf_frame_ms',
+    # SSTV
+    'sstv_vox',
+    # Beacon form defaults
+    'bcn_interval', 'bcn_repeat', 'bcn_engine', 'bcn_voice',
+    # Special Ops
+    'numbers_station_interval', 'numbers_station_engine', 'numbers_station_voice',
+    'numbers_station_cadence',
+    'solar_autotx_enabled', 'solar_kindex_threshold', 'solar_engine', 'solar_voice',
+    'mystery_window_start', 'mystery_window_end', 'mystery_engine', 'mystery_voice',
+    'autoid_callsign', 'autoid_interval', 'autoid_engine', 'autoid_voice',
+    'timeannounce_interval', 'timeannounce_engine', 'timeannounce_voice',
+    'evp_interval', 'evp_engine', 'evp_voice',
+    'whisper_interval', 'whisper_engine', 'whisper_voice',
+    # Sentient Radio
+    'sentient_audio_in', 'sentient_whisper_model', 'sentient_silence_sec',
+    'sentient_energy', 'sentient_mode', 'sentient_trigger',
+    'sentient_ai_model', 'sentient_persona', 'sentient_temp',
+    'sentient_tx_engine', 'sentient_tx_voice', 'sentient_tx_preset',
+    'sentient_handshake',
+    # Pirate Broadcast
+    'pirate_interval', 'pirate_engine', 'pirate_voice',
+    # Ghost audio
+    'ghost_engine', 'ghost_voice',
+    # IRC mode
+    'irc_mode',
+    # Browser tab stream (Chrome extension)
+    'stream_token', 'stream_max_min', 'stream_idle_sec',
+    'stream_vox_sec', 'stream_vox_level',
+}
 
 
 @app.route('/api/config/export', methods=['GET'])
@@ -5068,34 +5165,16 @@ def api_config_import():
     }
 
     # -- 1. Core settings -------------------------------------
-    # Every key that _app_settings can hold is allowed - we use the
-    # same whitelist as /api/settings plus the extra keys added in v2.11.x
-    SETTINGS_ALLOWED = {
-        # Radio connection
-        'serial_port', 'baud_rate', 'ci_v_address',
-        # Audio
-        'gong_path',
-        # AI / Ollama
-        'ollama_url', 'ollama_model', 'ollama_enabled',
-        'ai_persona', 'ai_temp', 'ai_max_tokens', 'ai_mode',
-        # AI TX voice (saved from AI tab)
-        'ai_tx_engine', 'ai_tx_voice', 'ai_auto_tx',
-        # Acid Trip agents
-        'trip_a_emoji', 'trip_a_engine', 'trip_a_voice',
-        'trip_a_provider', 'trip_a_model',
-        'trip_b_emoji', 'trip_b_engine', 'trip_b_voice',
-        'trip_b_provider', 'trip_b_model',
-        'trip_turns', 'trip_delay', 'trip_max_tok', 'trip_temp',
-        # Transmit tab defaults
-        'tx_engine', 'tx_voice', 'tx_delay', 'tx_repeat',
-        # Memory / Qdrant
-        'memory_enabled', 'memory_qdrant_host', 'memory_embed_model',
-    }
+    # Every key that _app_settings can hold is allowed - same whitelist as
+    # POST /api/settings, so an exported backup round-trips every key.
+    SETTINGS_ALLOWED = SETTINGS_KEYS
     settings_patch = data.get('settings', {})
     with _app_settings_lock:
         for k, v in settings_patch.items():
             if k in SETTINGS_ALLOWED:
-                _app_settings[k] = v
+                # Normalise like POST /api/settings: export emits bools/ints
+                # and consumers compare against 'true' / call .strip()
+                _app_settings[k] = str(v).strip().lower() if isinstance(v, bool) else str(v).strip()
                 results['settings_applied'].append(k)
             elif not k.startswith('__'):
                 results['skipped'].append(f'settings.{k} (unknown key)')
@@ -5104,7 +5183,7 @@ def api_config_import():
         ui_patch = data.get('ui_presets', {})
         for k, v in ui_patch.items():
             if k in SETTINGS_ALLOWED:
-                _app_settings[k] = v
+                _app_settings[k] = str(v).strip().lower() if isinstance(v, bool) else str(v).strip()
                 results['ui_presets_applied'].append(k)
 
         if results['settings_applied'] or results['ui_presets_applied']:
@@ -5166,17 +5245,22 @@ def api_config_import():
         try:
             existing_resp = api_schedule_list()
             existing_jobs = (existing_resp.get_json() or {}).get('jobs', [])
-            existing_sigs = {(j.get('message',''), j.get('cron_expression','')) for j in existing_jobs}
+            _sig = lambda b: (b['text'] or b['sound_file'], b['cron'])
+            existing_sigs = {_sig(_sched_job_body(j)) for j in existing_jobs}
             for job in schedules_in:
-                sig = (job.get('message', ''), job.get('cron_expression', ''))
+                body = _sched_job_body(job)
+                sig = _sig(body)
+                if not body['cron'] or not (body['text'] or body['sound_file']):
+                    results['skipped'].append(f'schedule:{job.get("id","?")} (no cron/text in export)')
+                    continue
                 if sig in existing_sigs:
                     results['skipped'].append(f'schedule:{sig[1]} "{sig[0][:30]}" (already exists)')
                     continue
                 try:
                     with app.test_request_context(
-                        '/api/schedules',
+                        '/api/schedule',
                         method='POST',
-                        json=job,
+                        json=body,
                         content_type='application/json'
                     ):
                         resp = api_schedule_add()
@@ -6662,7 +6746,12 @@ def _ctrl_poller():
         if not enabled:
             time_module.sleep(5)
             continue
-        err = _ctrl_poll_once()
+        try:
+            err = _ctrl_poll_once()
+        except Exception as e:
+            # Never let one bad payload kill the poller thread for good
+            logger.exception('discord-ctrl-poller: unexpected error')
+            err = f'Poller exception: {e}'
         with _ctrl_lock:
             if err:
                 _ctrl_state['error'] = err
@@ -6843,7 +6932,12 @@ def _discord_poller():
             time_module.sleep(5)
             continue
 
-        err = _discord_poll_once()
+        try:
+            err = _discord_poll_once()
+        except Exception as e:
+            # Never let one bad payload kill the poller thread for good
+            logger.exception('discord-poller: unexpected error')
+            err = f'Poller exception: {e}'
         if err:
             with _discord_lock:
                 _discord_state['connected'] = False
@@ -7447,7 +7541,7 @@ def _dbot_handle_command(content: str, raw_content: str, author: str) -> str | N
 
     # ── FREQUENCY COMMAND ──
     # "slurper tune to 14.225" / "slurper frequency 7200" / "slurper go to 28.400 mhz"
-    freq_match = _re.search(r'(?:tune|freq|frequency|go to|set freq|qsy|change to)\s+(?:to\s+)?(\d+[\.\d]*)\s*(mhz|khz)?', text)
+    freq_match = _re.search(r'(?:tune|freq|frequency|go to|set freq|qsy|change to)\s+(?:to\s+)?(\d+(?:\.\d+)?)\s*(mhz|khz)?', text)
     if freq_match:
         val = float(freq_match.group(1))
         unit = (freq_match.group(2) or '').lower()
@@ -8084,7 +8178,10 @@ def _dbot_engine():
     _dbot_log('ENGINE', 'Bot engine started')
 
     _dbot_resolve_bot_id()
-    _seen_ids = set()
+    # Seed with everything already in the buffer so a (re)start doesn't replay
+    # history -- old "say ..." commands would otherwise be re-transmitted.
+    with _discord_lock:
+        _seen_ids = {m.get('id') for m in _discord_messages}
     _last_quiet_check = time_module.time()
     _last_ramble_check = time_module.time()  # private to engine — not exposed via API
     _poll_count = 0
@@ -8121,11 +8218,10 @@ def _dbot_engine():
 
             # Find new messages we haven't processed
             new_msgs = [m for m in msgs if m.get('id') not in _seen_ids]
-            for m in msgs:
-                _seen_ids.add(m.get('id'))
-            # Cap seen_ids to prevent memory leak
-            if len(_seen_ids) > 500:
-                _seen_ids = set(list(_seen_ids)[-200:])
+            # The ring buffer is the authority: keep exactly its IDs. (The old
+            # set(list(...)[-200:]) trim evicted *random* IDs, so messages still
+            # in the buffer came back as "new" and got re-transmitted.)
+            _seen_ids = {m.get('id') for m in msgs}
 
             now = time_module.time()
 
@@ -8658,8 +8754,10 @@ class ALSAAudioSource(_AudioSourceBase):
             'pipe:1'
         ]
         _voice_log(f'ffmpeg cmd: {" ".join(cmd)}')
+        # stderr -> DEVNULL: it was a PIPE that nothing drained while streaming,
+        # so sustained ALSA xrun spam could block ffmpeg and freeze the stream.
         self._process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             bufsize=3840 * 4  # ~80ms buffer
         )
 
@@ -8670,25 +8768,21 @@ class ALSAAudioSource(_AudioSourceBase):
             return b''
         data = self._process.stdout.read(3840)
         if len(data) == 0:
-            # ffmpeg exited — check stderr
+            # ffmpeg exited
             try:
-                err = self._process.stderr.read().decode('utf-8', errors='replace')[:300]
-                if err:
-                    _voice_log(f'ffmpeg stderr: {err}')
                 rc = self._process.poll()
                 _voice_log(f'ffmpeg exited rc={rc}')
             except Exception:
                 pass
             return b''
-        # Calculate RMS and peak from the PCM data
+        # RMS and peak via numpy -- this runs every 20 ms in the gevent worker,
+        # so a pure-Python loop over 1920 samples competes with HTTP latency.
         try:
-            import struct
-            samples = struct.unpack(f'<{len(data)//2}h', data)
-            if samples:
-                rms_val = int((sum(s*s for s in samples) / len(samples)) ** 0.5)
-                peak_val = max(abs(s) for s in samples)
-                _voice_rms = rms_val
-                _voice_peak = peak_val
+            import numpy as np
+            a = np.frombuffer(data, dtype=np.int16).astype(np.int32)
+            if a.size:
+                _voice_rms  = int(np.sqrt(np.mean(a * a)))
+                _voice_peak = int(np.abs(a).max())
         except Exception:
             pass
         return data
@@ -8739,19 +8833,22 @@ async def _voice_join_async(channel_id: str):
     dev = AUDIO_DEVICE if (AUDIO_DEVICE and AUDIO_DEVICE != 'default') else 'default'
     _voice_log(f'Starting ALSA capture from {dev}')
 
-    _voice_source = ALSAAudioSource(device=dev)
+    src = ALSAAudioSource(device=dev)
+    _voice_source = src
 
     def _on_stream_end(error):
+        # Close over THIS source: on a re-join the old player's callback fires
+        # after the new source is installed and used to kill the new ffmpeg.
         global _voice_source
         if error:
             _voice_log(f'Stream error: {error}')
         else:
             _voice_log('Stream ended')
-        if _voice_source:
-            _voice_source.cleanup()
+        src.cleanup()
+        if _voice_source is src:
             _voice_source = None
 
-    _voice_conn.play(_voice_source, after=_on_stream_end)
+    _voice_conn.play(src, after=_on_stream_end)
 
     # Verify playback after 1.5s
     await asyncio.sleep(1.5)
@@ -9348,14 +9445,27 @@ def _clips_has_fx(fx: dict) -> bool:
     return False
 
 
-def _clips_play(clip: dict, fx: dict = None):
+def _clips_play(clip: dict, fx: dict = None, gen: int = None):
     """
     PTT + play a clip with optional FX chain.  Runs in a daemon thread.
     Sets/clears _clips_playing.  Uses ffplay (all formats) with aplay fallback.
+
+    `gen` is the _clips_gen value this play was started with. When a newer play
+    interrupts us, our finally must NOT drop PTT or clear _clips_playing --
+    that used to un-key the radio under the new clip.
     """
     global _clips_playing, _clips_proc
+    if gen is None:
+        gen = _clips_gen
     ext = (clip.get('ext') or '').upper()
     fx_temp = None  # temp file for FX-processed audio
+    # Serialise with TTS/beacons/stream so two paths never fight over PTT.
+    if not _tx_exec_lock.acquire(timeout=60):
+        logger.warning('clips: TX busy for 60s, giving up')
+        with _clips_lock:
+            if gen == _clips_gen:
+                _clips_playing = False
+        return
     try:
         # Resolve playback path
         if clip['source'] == 's3':
@@ -9497,21 +9607,28 @@ def _clips_play(clip: dict, fx: dict = None):
                     logger.warning(f'clips: gong error: {ge}')
 
     finally:
-        _clips_proc = None
+        with _clips_lock:
+            current = (gen == _clips_gen)
+            if current:
+                _clips_proc = None
         # Clean up FX temp files
         if fx_temp:
             try: os.remove(fx_temp)
             except Exception: pass
-        # PTT off
-        try:
-            if orchestrator.icom_agent and orchestrator.icom_agent.serial_conn \
-                    and orchestrator.icom_agent.serial_conn.is_open:
-                orchestrator.icom_agent.ptt_off()
-        except Exception:
-            pass
-        with _clips_lock:
-            _clips_playing = False
-        logger.info('clips: playback complete')
+        if current:
+            # PTT off
+            try:
+                if orchestrator.icom_agent and orchestrator.icom_agent.serial_conn \
+                        and orchestrator.icom_agent.serial_conn.is_open:
+                    orchestrator.icom_agent.ptt_off()
+            except Exception:
+                pass
+            with _clips_lock:
+                _clips_playing = False
+            logger.info('clips: playback complete')
+        else:
+            logger.info('clips: superseded by a newer play -- leaving PTT to it')
+        _tx_exec_lock.release()
 
 
 def _clips_poller():
@@ -9573,14 +9690,17 @@ def api_clips_play():
     if killed:
         time_module.sleep(0.1)  # grace period only when we killed something
 
+    global _clips_gen
     with _clips_lock:
         clip = next((f for f in _clips_files if f['name'] == name), None)
         if clip is None:
             return jsonify({'success': False, 'message': f'Clip not found: {name}. Click SCAN ALL to refresh.'}), 404
         _clips_playing = True
+        _clips_gen += 1
+        gen = _clips_gen
 
     fx = data.get('effects', {})
-    threading.Thread(target=_clips_play, args=(clip, fx),
+    threading.Thread(target=_clips_play, args=(clip, fx, gen),
                      daemon=True, name='clips-play').start()
     return jsonify({'success': True, 'message': f'Playing {name}'})
 
@@ -9595,12 +9715,10 @@ def api_clips_stop():
         _clips_proc = None
         _clips_playing = False
     if proc:
-        try: proc.kill()
+        try: proc.kill(); proc.wait(timeout=2)
         except Exception: pass
-    # Belt-and-suspenders: pkill any stragglers
-    for player in ('ffplay', 'aplay'):
-        try: subprocess.run(['pkill', '-f', player], capture_output=True, timeout=5)
-        except Exception: pass
+    # (No `pkill -f aplay` here: it also killed the roger-beep, TTS, gong and
+    # browser-stream players. The tracked Popen above is the one we own.)
     try:
         orchestrator.icom_agent.ptt_off()
     except Exception:
@@ -9651,6 +9769,9 @@ def api_clips_rename():
         return jsonify({'success': True, 'message': f'Renamed to {new_name}', 'new_name': new_name})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/clips/status', methods=['GET'])
 def api_clips_status():
     with _clips_lock:
         return jsonify({
@@ -9883,6 +10004,8 @@ def trip_commands_page():
 
 
 # -- System health ---------------------------------------------
+_health_cache = {'ts': 0.0, 'deps': {}, 'services': {}}   # slow-changing probes, 60s TTL
+
 @app.route('/api/system/health')
 def api_system_health():
     import subprocess as sp, shutil, platform, os
@@ -9898,7 +10021,9 @@ def api_system_health():
         'db_rows': {}, 'log_lines': [],
     }
     if _psutil_ok:
-        h['cpu_pct']   = _psutil.cpu_percent(interval=0.4)
+        # interval=None returns usage since the previous call (non-blocking);
+        # the 10 s poll cadence gives a meaningful window.
+        h['cpu_pct']   = _psutil.cpu_percent(interval=None)
         vm = _psutil.virtual_memory()
         h['ram_total'] = round(vm.total/1024**2)
         h['ram_used']  = round(vm.used/1024**2)
@@ -9928,41 +10053,50 @@ def api_system_health():
             except Exception:
                 pass
 
-    dep_checks = {
-        'sox':         ['sox','--version'],
-        'ffmpeg':      ['ffmpeg','-version'],
-        'aplay':       ['aplay','--version'],
-        'espeak-ng':   ['espeak-ng','--version'],
-        'python3':     ['python3','--version'],
-        'pyserial':    ['python3','-c','import serial; print(serial.VERSION)'],
-        'flask':       ['python3','-c','import flask; print(flask.__version__)'],
-        'apscheduler': ['python3','-c','import apscheduler; print(apscheduler.__version__)'],
-        'psutil':      ['python3','-c','import psutil; print(psutil.__version__)'],
-        'pysstv':      ['python3','-c','import pysstv; print("ok")'],
-        'pillow':      ['python3','-c','from PIL import Image; print(Image.__version__)'],
-    }
-    for dep, cmd in dep_checks.items():
-        try:
-            r = sp.run(cmd, capture_output=True, text=True, timeout=5)
-            raw = (r.stdout+r.stderr).strip()
-            out = raw.splitlines()[0][:60] if raw else 'ok'
-            h['deps'][dep] = {'ok': r.returncode==0, 'version': out}
-        except Exception as e:
-            h['deps'][dep] = {'ok': False, 'version': str(e)[:40]}
-
-    for svc in ['riggpt']:
-        try:
-            r = sp.run(['systemctl','is-active',svc], capture_output=True, text=True, timeout=3)
-            h['services'][svc] = r.stdout.strip()
-        except Exception:
-            h['services'][svc] = 'unknown'
+    # Dependency versions change only on install, yet this endpoint is polled
+    # every 10 s: cache them (60 s) and probe Python packages in-process
+    # instead of spawning 7 `python3 -c import ...` interpreters per poll.
+    now = time_module.time()
+    if now - _health_cache.get('ts', 0) > 60:
+        deps = {}
+        for dep, cmd in {
+            'sox':       ['sox','--version'],
+            'ffmpeg':    ['ffmpeg','-version'],
+            'aplay':     ['aplay','--version'],
+            'espeak-ng': ['espeak-ng','--version'],
+        }.items():
+            try:
+                r = sp.run(cmd, capture_output=True, text=True, timeout=5)
+                raw = (r.stdout+r.stderr).strip()
+                out = raw.splitlines()[0][:60] if raw else 'ok'
+                deps[dep] = {'ok': r.returncode==0, 'version': out}
+            except Exception as e:
+                deps[dep] = {'ok': False, 'version': str(e)[:40]}
+        deps['python3'] = {'ok': True, 'version': platform.python_version()}
+        from importlib import metadata as _md
+        for dep, pkg in {'pyserial': 'pyserial', 'flask': 'flask', 'apscheduler': 'apscheduler',
+                         'psutil': 'psutil', 'pysstv': 'pysstv', 'pillow': 'pillow',
+                         'flask-sock': 'flask-sock'}.items():
+            try:
+                deps[dep] = {'ok': True, 'version': _md.version(pkg)}
+            except Exception:
+                deps[dep] = {'ok': False, 'version': 'not installed'}
+        services = {}
+        for svc in ['riggpt']:
+            try:
+                r = sp.run(['systemctl','is-active',svc], capture_output=True, text=True, timeout=3)
+                services[svc] = r.stdout.strip()
+            except Exception:
+                services[svc] = 'unknown'
+        _health_cache.update({'ts': now, 'deps': deps, 'services': services})
+    h['deps']     = _health_cache['deps']
+    h['services'] = _health_cache['services']
 
     try:
         h['db_size_kb'] = round(os.path.getsize(DB_PATH)/1024, 1)
-        conn = sqlite3.connect(DB_PATH)
-        h['db_rows']['transmissions'] = conn.execute('SELECT COUNT(*) FROM transmissions').fetchone()[0]
-        h['db_rows']['system_events'] = conn.execute('SELECT COUNT(*) FROM system_events').fetchone()[0]
-        conn.close()
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            h['db_rows']['transmissions'] = conn.execute('SELECT COUNT(*) FROM transmissions').fetchone()[0]
+            h['db_rows']['system_events'] = conn.execute('SELECT COUNT(*) FROM system_events').fetchone()[0]
     except Exception:
         pass
 
@@ -10834,9 +10968,9 @@ def _live_resolve_sample(name: str) -> str | None:
         clip_path = os.path.join(clips_dir, f'{name}{ext}')
         if os.path.exists(clip_path):
             return clip_path
-    # Direct full path? (might already include extension)
-    if os.path.exists(name):
-        return name
+    # No arbitrary-path fallback: names come from the UI/API and must stay
+    # inside LIVE_DIR or the clips dir (any readable file could otherwise be
+    # fed to sox/aplay).
     return None
 
 
@@ -11360,7 +11494,7 @@ def api_numbers_station_start():
             except Exception: pass
         _numbers_station_job = scheduler.add_job(
             _run_numbers_station,
-            CronTrigger.from_crontab(f'*/{interval} * * * *'),
+            IntervalTrigger(minutes=interval),
             id='numbers_station', replace_existing=True,
         )
         threading.Thread(target=_run_numbers_station, daemon=True, name='ns-initial').start()
@@ -11527,12 +11661,22 @@ _MYSTERY_LINES = [
 
 def _run_mystery_tx():
     import random
+    global _clips_playing, _clips_gen
     with _clips_lock:
         files = list(_clips_files)
     if files:
         clip = random.choice(files)
+        # Go through the same state as api_clips_play so the UI can see/stop it
+        # and we don't stomp on a clip the operator is already playing.
+        with _clips_lock:
+            if _clips_playing:
+                logger.info('mystery: a clip is already playing, skipping this window')
+                return
+            _clips_playing = True
+            _clips_gen += 1
+            gen = _clips_gen
         logger.info(f'mystery: transmitting clip: {clip["name"]}')
-        threading.Thread(target=_clips_play, args=(clip,), daemon=True, name='mystery-tx').start()
+        threading.Thread(target=_clips_play, args=(clip, None, gen), daemon=True, name='mystery-tx').start()
     else:
         msg = random.choice(_MYSTERY_LINES)
         engine = _app_settings.get('mystery_engine', 'espeak')
@@ -11653,7 +11797,7 @@ def api_autoid_start():
             except Exception: pass
         _autoid_job = scheduler.add_job(
             _run_autoid,
-            CronTrigger.from_crontab(f'*/{interval} * * * *'),
+            IntervalTrigger(minutes=interval),
             id='autoid', replace_existing=True,
         )
         threading.Thread(target=_run_autoid, daemon=True, name='autoid-initial').start()
@@ -11723,7 +11867,7 @@ def api_timeannounce_start():
             except Exception: pass
         _timeannounce_job = scheduler.add_job(
             _run_time_announce,
-            CronTrigger.from_crontab(f'*/{interval} * * * *'),
+            IntervalTrigger(minutes=interval),
             id='time_announce', replace_existing=True,
         )
         threading.Thread(target=_run_time_announce, daemon=True, name='timeannounce-initial').start()
@@ -11810,6 +11954,7 @@ def _run_evp():
     pitch  = random.randint(-10, -4)
     speed  = random.randint(50, 75) / 100.0
 
+    raw_wav = fx_wav = None
     try:
         # Step 1: Generate raw TTS
         text = _clean_tts_text(phrase)
@@ -11872,8 +12017,13 @@ def _run_evp():
             os.close(_fd)
             collage.export(collage_path, format='wav')
 
-            # Step 4: PTT + play the collage
+            # Step 4: PTT + play the collage (under the TX lock like execute())
             ptt_active = False
+            if not _tx_exec_lock.acquire(timeout=60):
+                logger.warning('evp: TX busy for 60s, skipping')
+                try: os.remove(collage_path)
+                except Exception: pass
+                return
             try:
                 if orchestrator._connected:
                     orchestrator.icom_agent.ptt_on()
@@ -11885,6 +12035,7 @@ def _run_evp():
                 if ptt_active:
                     try: orchestrator.icom_agent.ptt_off()
                     except Exception: pass
+                _tx_exec_lock.release()
                 try: os.remove(collage_path)
                 except Exception: pass
 
@@ -11908,6 +12059,13 @@ def _run_evp():
 
     except Exception as e:
         logger.error(f'evp TX error: {e}', exc_info=True)
+    finally:
+        # execute() removes its TTS/FX temp files; EVP runs forever on a
+        # schedule, so without this /tmp fills up two WAVs per interval.
+        for _p in {raw_wav, fx_wav}:
+            if _p and os.path.exists(_p):
+                try: os.remove(_p)
+                except Exception: pass
 
 
 @app.route('/api/evp/start', methods=['POST'])
@@ -11928,7 +12086,7 @@ def api_evp_start():
             try: _evp_job.remove()
             except Exception: pass
         _evp_job = scheduler.add_job(
-            _run_evp, CronTrigger.from_crontab(f'*/{interval} * * * *'),
+            _run_evp, IntervalTrigger(minutes=interval),
             id='evp_mode', replace_existing=True,
         )
         threading.Thread(target=_run_evp, daemon=True, name='evp-initial').start()
@@ -12056,7 +12214,7 @@ def api_whisper_start():
             try: _whisper_job.remove()
             except Exception: pass
         _whisper_job = scheduler.add_job(
-            _run_whisper, CronTrigger.from_crontab(f'*/{interval} * * * *'),
+            _run_whisper, IntervalTrigger(minutes=interval),
             id='whisper_mode', replace_existing=True,
         )
         threading.Thread(target=_run_whisper, daemon=True, name='whisper-initial').start()
@@ -12429,7 +12587,9 @@ def _sentient_listener_loop():
                     wf.setframerate(sr)
                     wf.writeframes((audio_f32 * 32767).astype(np.int16).tobytes())
 
-                text = _transcribe(wav_path)
+                # Whisper is seconds of pure CPU: run it in a real thread so the
+                # gevent worker keeps serving HTTP/SSE and the Live engine's poll.
+                text = _cpu_offload(_transcribe, wav_path)
             finally:
                 try: os.remove(wav_path)
                 except Exception: pass
@@ -12500,6 +12660,7 @@ def _sentient_listener_loop():
                 if handshake_enabled and orchestrator._connected:
                     hs_path = _sentient_handshake_wav()
                     ptt_active = False
+                    raw_wav = fx_wav = None
                     try:
                         orchestrator.icom_agent.ptt_on()
                         ptt_active = True
@@ -12533,6 +12694,11 @@ def _sentient_listener_loop():
                         if ptt_active:
                             try: orchestrator.icom_agent.ptt_off()
                             except Exception: pass
+                        # execute() removes its TTS/FX temp files; this path must too
+                        for _p in {raw_wav, fx_wav}:
+                            if _p and os.path.exists(_p):
+                                try: os.remove(_p)
+                                except Exception: pass
                 else:
                     _sent_result = orchestrator.execute(reply, engine=engine, voice=voice,
                                          preset=preset, roger_beep=False)
@@ -12852,8 +13018,8 @@ def _ghost_run_power_wobble(stop: threading.Event, depth: int = 50):
         if not _ghost_connected():
             _ghost_log_event('power_wobble: radio not connected')
             return
-        # Read current power
-        base_power = agent.read_rf_power() or 128
+        # Read current power SETTING (0x14 0x0A) -- read_rf_power is the PO meter
+        base_power = agent.read_level(0x0A) or 128
         _ghost_log_event(f'power_wobble: base={base_power} depth=±{depth}')
         t = 0.0
         rate = random.uniform(0.3, 2.0)  # Hz
@@ -12861,10 +13027,9 @@ def _ghost_run_power_wobble(stop: threading.Event, depth: int = 50):
         while not stop.is_set():
             wobble = int(depth * math.sin(2 * math.pi * rate * t))
             new_power = max(0, min(255, base_power + wobble))
-            # set_level subcmd 0x0A = TX power
-            hi = (new_power >> 8) & 0xFF
-            lo = new_power & 0xFF
-            agent.send_command(0x14, 0x0A, hi, lo)
+            # set_level subcmd 0x0A = TX power (BCD-encoded by set_level; the
+            # old raw hi/lo bytes were binary and NAK'd or mis-set for >= 10)
+            agent.set_level(0x0A, new_power)
             _loop_n += 1
             if _loop_n % 100 == 0:
                 _ghost_whisper('power_wobble', stop)
@@ -13231,7 +13396,7 @@ def api_pirate_start():
             except Exception: pass
         _pirate_job = scheduler.add_job(
             _run_pirate_broadcast,
-            CronTrigger.from_crontab(f'*/{interval} * * * *'),
+            IntervalTrigger(minutes=interval),
             id='pirate_broadcast', replace_existing=True,
         )
         threading.Thread(target=_run_pirate_broadcast, daemon=True, name='pirate-initial').start()
@@ -13293,6 +13458,334 @@ def api_voice_roulette():
         'speed':   speed,
         'message': f'Roulette: {engine} / {preset} / pitch {pitch:+d} / speed {speed}x',
     })
+
+
+# =============================================================
+# Browser Tab Audio Stream  (Chrome extension -> WebSocket -> aplay -> PTT)
+# =============================================================
+# The companion extension in chrome-extension/ captures a tab's audio
+# (YouTube etc.) and ships 16-bit PCM over ws://host:5000/api/stream/tx.
+# We pipe it into aplay on the radio's USB codec and key PTT via CI-V.
+#
+# Wire protocol:
+#   client -> text   {"type":"start","token":..,"rate":48000,"channels":1,"title":..}
+#   server -> text   {"type":"ok"}  |  {"type":"error","message":..}  (then close)
+#   client -> binary Int16LE PCM frames (~20 ms each)
+#   server -> text   {"type":"status","seconds":n,"level":0-100,"ptt":bool}  (1/s)
+#   client -> text   {"type":"stop"}
+#
+# Safety: PTT drops on socket close, on /api/stream/stop, on TX terminate,
+# on the dead-man heartbeat, after stream_idle_sec with no frames, after
+# stream_max_min minutes, and (VOX) after stream_vox_sec of near-silence
+# so a paused video doesn't leave a dead carrier on the air.
+
+try:
+    from flask_sock import Sock as _FlaskSock
+    _sock = _FlaskSock(app)
+except ImportError:          # pip3 install flask-sock
+    _sock = None
+    logger.warning('flask-sock not installed -- browser tab streaming disabled')
+
+_stream_lock  = threading.Lock()      # guards _stream_state / _stream_proc
+_stream_abort = threading.Event()     # set to end the active stream from anywhere
+_stream_proc  = None                  # aplay Popen fed via stdin
+_stream_state = {
+    'available':  _sock is not None,
+    'active':     False,
+    'title':      '',
+    'client':     '',
+    'started':    0.0,
+    'seconds':    0,
+    'bytes':      0,
+    'level':      0,       # peak %, last frame
+    'ptt':        False,
+    'vox_hold':   False,   # True while VOX has PTT released during silence
+    'last_error': '',
+    'last_end':   '',      # why the previous stream ended
+}
+
+_STREAM_DEFAULTS = {
+    'stream_token':     '',      # shared secret; blank = any LAN client
+    'stream_max_min':   '30',    # hard TX limit per stream
+    'stream_idle_sec':  '5',     # no frames for this long -> end stream
+    'stream_vox_sec':   '4',     # near-silence for this long -> drop PTT (0 = off)
+    'stream_vox_level': '2',     # peak % considered silence
+}
+
+
+def _stream_cfg(key):
+    v = _app_settings.get(key, _STREAM_DEFAULTS[key])
+    return v if v not in (None, '') else _STREAM_DEFAULTS[key]
+
+
+def _stream_cfg_int(key, lo, hi):
+    try:
+        return max(lo, min(hi, int(float(_stream_cfg(key)))))
+    except (TypeError, ValueError):
+        return int(_STREAM_DEFAULTS[key])
+
+
+def _stream_kill():
+    """Abort the active stream (idempotent). Safe from any thread/route."""
+    global _stream_proc
+    _stream_abort.set()
+    with _stream_lock:
+        proc = _stream_proc
+    if proc is not None:
+        try: proc.stdin.close()
+        except Exception: pass
+        try: proc.terminate()
+        except Exception: pass
+
+
+def _stream_ptt(agent, on):
+    """Key/unkey with the same poller pause execute() uses, but only around the
+    CI-V command so the dashboard keeps polling during a long stream."""
+    global _poller_paused
+    _poller_paused = True
+    try:
+        time_module.sleep(0.05)
+        if on: agent.ptt_on()
+        else:  agent.ptt_off()
+    finally:
+        _poller_paused = False
+
+
+def _stream_run(ws):
+    """WebSocket handler body. Runs in the gevent worker (cooperative)."""
+    global _stream_proc
+    import numpy as np
+
+    def _send(obj):
+        try: ws.send(json.dumps(obj))
+        except Exception: pass
+
+    def _refuse(msg):
+        _send({'type': 'error', 'message': msg})
+        try: ws.close(reason=msg)
+        except Exception: pass
+
+    # -- Handshake ---------------------------------------------------
+    try:
+        first = ws.receive(timeout=5)
+    except Exception:
+        first = None
+    if not isinstance(first, str):
+        return _refuse('expected start message')
+    try:
+        hello = json.loads(first)
+    except Exception:
+        return _refuse('bad start message')
+    if hello.get('type') != 'start':
+        return _refuse('expected start message')
+    token = _stream_cfg('stream_token')
+    if token and str(hello.get('token', '')) != token:
+        logger.warning(f'stream: bad token from {request.remote_addr}')
+        return _refuse('bad token')
+    try:
+        rate = int(hello.get('rate', 48000))
+        channels = int(hello.get('channels', 1))
+    except (TypeError, ValueError):
+        return _refuse('bad audio format')
+    if rate not in (8000, 16000, 22050, 24000, 32000, 44100, 48000) or channels not in (1, 2):
+        return _refuse('unsupported audio format')
+    title = str(hello.get('title', 'browser tab'))[:120]
+
+    if not orchestrator._connected:
+        return _refuse('Radio not connected')
+    if not _tx_exec_lock.acquire(blocking=False):
+        return _refuse('Another transmission is in progress')
+    if not _play_file_lock.acquire(blocking=False):
+        _tx_exec_lock.release()
+        return _refuse('Audio device busy')
+
+    agent     = orchestrator.icom_agent
+    dev       = AUDIO_DEVICE if (AUDIO_DEVICE and AUDIO_DEVICE != 'default') else None
+    max_sec   = _stream_cfg_int('stream_max_min', 1, 240) * 60
+    idle_sec  = _stream_cfg_int('stream_idle_sec', 2, 60)
+    vox_sec   = _stream_cfg_int('stream_vox_sec', 0, 60)
+    vox_level = _stream_cfg_int('stream_vox_level', 0, 50)
+    bytes_per_sec = rate * channels * 2
+
+    proc = None
+    ptt = False
+    end_reason = 'closed'
+    start = time_module.time()
+    last_frame = start
+    last_status = 0.0
+    silent_since = None
+    total = 0
+    level = 0
+
+    _stream_abort.clear()
+    with _stream_lock:
+        _stream_state.update({
+            'active': True, 'title': title, 'client': request.remote_addr or '',
+            'started': start, 'seconds': 0, 'bytes': 0, 'level': 0,
+            'ptt': False, 'vox_hold': False, 'last_error': '',
+        })
+    logger.info(f'stream: START {title!r} from {request.remote_addr} '
+                f'{rate}Hz x{channels} dev={dev or "system-default"}')
+    log_event('INFO', 'STREAM', f'Browser stream start: {title}')
+
+    try:
+        cmd = ['aplay', '-q', '-t', 'raw', '-f', 'S16_LE', '-r', str(rate), '-c', str(channels),
+               '--buffer-time=250000', '--period-time=25000']
+        if dev:
+            cmd += ['-D', dev]
+        cmd.append('-')
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with _stream_lock:
+            _stream_proc = proc
+
+        # Prime ~100 ms of silence so aplay has the device open and buffered
+        # before PTT, then key. Same low-latency ordering as play_file.
+        proc.stdin.write(b'\x00' * (bytes_per_sec // 10))
+        _stream_ptt(agent, True)
+        ptt = True
+        with _stream_lock:
+            _stream_state['ptt'] = True
+        _send({'type': 'ok'})
+
+        while True:
+            if _stream_abort.is_set():
+                end_reason = 'stopped'
+                break
+            if proc.poll() is not None:
+                end_reason = 'aplay exited'
+                break
+            now = time_module.time()
+            if now - start > max_sec:
+                end_reason = f'max {max_sec // 60} min reached'
+                break
+            if now - last_frame > idle_sec:
+                end_reason = 'no audio from browser'
+                break
+
+            try:
+                data = ws.receive(timeout=0.5)
+            except Exception:
+                end_reason = 'browser disconnected'
+                break
+            if data is None:
+                continue                         # receive timeout -> re-check guards
+            if isinstance(data, str):
+                try:
+                    m = json.loads(data)
+                except Exception:
+                    continue
+                if m.get('type') == 'stop':
+                    end_reason = 'stopped by browser'
+                    break
+                continue
+
+            last_frame = now
+            total += len(data)
+            try:
+                proc.stdin.write(data)
+            except (BrokenPipeError, OSError):
+                end_reason = 'aplay pipe closed'
+                break
+
+            # Peak level (cheap numpy; ~1k samples per frame)
+            try:
+                a = np.frombuffer(data[:len(data) & ~1], dtype=np.int16)
+                level = int(np.abs(a.astype(np.int32)).max() * 100 / 32768) if a.size else 0
+            except Exception:
+                level = 0
+
+            # VOX: drop PTT during sustained silence (paused video), re-key on audio
+            if vox_sec > 0:
+                if level <= vox_level:
+                    if silent_since is None:
+                        silent_since = now
+                    elif ptt and now - silent_since >= vox_sec:
+                        _stream_ptt(agent, False)
+                        ptt = False
+                        logger.info('stream: VOX silence -> PTT off')
+                else:
+                    silent_since = None
+                    if not ptt:
+                        _stream_ptt(agent, True)
+                        ptt = True
+                        logger.info('stream: audio resumed -> PTT on')
+
+            if now - last_status >= 1.0:
+                last_status = now
+                secs = int(now - start)
+                with _stream_lock:
+                    _stream_state.update({'seconds': secs, 'bytes': total,
+                                          'level': level, 'ptt': ptt,
+                                          'vox_hold': not ptt})
+                _send({'type': 'status', 'seconds': secs, 'level': level, 'ptt': ptt})
+
+    except Exception as e:
+        end_reason = f'error: {e}'
+        logger.error(f'stream: error: {e}', exc_info=True)
+        with _stream_lock:
+            _stream_state['last_error'] = str(e)
+    finally:
+        # Let the last buffered audio drain briefly, then tear down. PTT off
+        # happens no matter what above raised.
+        if proc is not None:
+            try: proc.stdin.close()
+            except Exception: pass
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                try: proc.kill(); proc.wait(timeout=2)
+                except Exception: pass
+            except Exception:
+                pass
+        if ptt:
+            try: _stream_ptt(agent, False)
+            except Exception:
+                try: agent.ptt_off()
+                except Exception: pass
+        with _stream_lock:
+            _stream_proc = None
+            _stream_state.update({'active': False, 'ptt': False, 'vox_hold': False,
+                                  'level': 0, 'last_end': end_reason,
+                                  'seconds': int(time_module.time() - start),
+                                  'bytes': total})
+        _play_file_lock.release()
+        _tx_exec_lock.release()
+        dur = round(time_module.time() - start, 1)
+        logger.info(f'stream: END ({end_reason}) {title!r} {dur}s {total // 1024}KB')
+        log_event('INFO', 'STREAM', f'Browser stream end ({end_reason}): {title} {dur}s')
+        try:
+            log_transmission(f'[browser stream] {title}', 'stream', '', 'none', dur, True)
+        except Exception:
+            pass
+        try: ws.close(reason=end_reason[:120])
+        except Exception: pass
+
+
+if _sock is not None:
+    @_sock.route('/api/stream/tx')
+    def api_stream_tx(ws):
+        _stream_run(ws)
+
+
+@app.route('/api/stream/status', methods=['GET'])
+def api_stream_status():
+    with _stream_lock:
+        snap = dict(_stream_state)
+    if snap['active']:
+        snap['seconds'] = int(time_module.time() - snap['started'])
+    snap['config'] = {k: _stream_cfg(k) for k in _STREAM_DEFAULTS}
+    snap['config']['stream_token'] = 'set' if _stream_cfg('stream_token') else ''
+    return jsonify(snap)
+
+
+@app.route('/api/stream/stop', methods=['POST'])
+def api_stream_stop():
+    with _stream_lock:
+        was_active = _stream_state['active']
+    _stream_kill()
+    return jsonify({'success': True,
+                    'message': 'Stream stopped' if was_active else 'No active stream'})
 
 
 def _startup():

@@ -60,6 +60,17 @@ Built by a ham who wanted to do something deeply stupid with a perfectly good ra
 - 24-slot cart machine with JINGLES / PROMOS / SPOTS / MISC tiers
 - OS drag-and-drop to assign files to cart slots
 
+### Browser Tab Stream (Chrome extension)
+- `chrome-extension/` is a Manifest V3 add-on that captures the audio of the
+  current Chrome tab (YouTube, etc.) and streams it as 48 kHz PCM over a
+  WebSocket to `/api/stream/tx`
+- RigGPT keys PTT via CI-V and pipes the audio into the radio's USB codec
+- Works with whatever you are logged into in Chrome — it captures the tab, not a URL
+- Live status, level meter and STOP in the **LIVE** tab (BROWSER STREAM card)
+- Safety: PTT drops on disconnect/idle/max-minutes, VOX-style release during
+  silence (paused video), optional shared token, serialised with every other TX path
+- Install steps in [`chrome-extension/README.md`](chrome-extension/README.md)
+
 ### TTS Engines
 eSpeak · Piper · Edge TTS · Google TTS · OpenAI TTS · ElevenLabs · Speechify · FastKoko (Kokoro)
 
@@ -141,8 +152,8 @@ Should work with any Icom radio that supports CI-V serial control and USB audio.
 ## Architecture
 
 ```
-Browser (operator UI)
-        ↓
+Browser (operator UI)                 Chrome extension (tab audio)
+        ↓                                       ↓ WebSocket PCM
 Flask app (app.py) — radio machine
         ├── CI-V serial → Icom radio (PTT + frequency + VFO + AGC + power)
         ├── ALSA aplay → USB audio codec → radio TX audio
