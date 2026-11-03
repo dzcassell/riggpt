@@ -31,7 +31,7 @@ async function closeOffscreen() {
 
 async function getSettings() {
   const d = await chrome.storage.local.get({
-    host: '192.168.40.10:5000',
+    host: '192.168.40.15:5001',
     token: '',
     gain: 100,
     monitor: true,

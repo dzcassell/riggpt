@@ -18,33 +18,39 @@ chrome-extension/       MV3 Chrome extension: tab audio → ws /api/stream/tx �
 CLAUDE.md               This file — read on startup
 ```
 
-## Server details
-- **Host:** root@radio (192.168.40.10)
-- **Service:** `riggpt` (systemd, port 5000)
-- **Install dir:** `/opt/riggpt`
-- **Python:** 3.13, Debian 13
-- **Config files (never touched by installer):**
-  - `/home/riggpt/app_settings.json` — all settings
-  - `/home/riggpt/api_keys.json` — API credentials
+## Server details (since v2.14.0: Docker on the GPU box)
+- **Host:** root@192.168.40.15 (`rtx5070ti`, Debian 13). The IC-7610 USB cable is on this box.
+- **Runs as:** Docker container `riggpt` from `/opt/riggpt` (`docker compose up -d --build`),
+  bridge network, **port 5001** on the host (5000 is taken by hermitsdr). UI: http://192.168.40.15:5001
+- **Host specifics:** `docker-compose.override.yml` (committed) — by-id serial mapping → `/dev/ttyUSB0`,
+  `/dev/snd`, `RIGGPT_AUDIO_DEVICE=plughw:CODEC`. Ollama is native on the host (`http://192.168.40.15:11434`), Qdrant in Docker (`:6333`).
+- **Config files (bind-mounted, never in the image):**
+  - `/opt/riggpt/data/config/app_settings.json` — all settings (container sees `/home/riggpt/`)
+  - `/opt/riggpt/data/config/api_keys.json` — API credentials
+  - `/opt/riggpt/data/sounds/` clips, `/opt/riggpt/data/wav_cache/` TX log audio
+- **Old host:** root@radio (192.168.40.10) ran the systemd install (`INSTALL.sh`) up to v2.13.49; no longer the deploy target.
 
 ## Current version: v2.14.0
 
-## Version sync rule — ALWAYS update all 5 on every version bump
+## Version sync rule — ALWAYS update all 6 on every version bump
 1. `app.py` docstring header (`RigGPT vX.X.X`)
 2. `app.py` `VERSION = 'vX.X.X'` constant
 3. `requirements.txt` comment line 1
 4. `INSTALL.sh` comment line 1 + `VERSION="X.X.X"` variable
 5. `templates/index.html` `<span class="sb-label">vX.X.X</span>` in `#statusbar`
+6. `Dockerfile` `LABEL ... version="X.X.X"`
 
 ## Deploy workflow
 ```bash
-# From /opt/riggpt (already in the right place):
-git pull && bash INSTALL.sh
+# On root@192.168.40.15, from /opt/riggpt:
+git pull && docker compose up -d --build
 
-# Check service after deploy:
-systemctl status riggpt
-journalctl -u riggpt -n 50
+# Check after deploy:
+docker compose ps
+docker compose logs -f --tail 50 riggpt
+curl -s localhost:5001/api/status | head -c 200
 ```
+(`INSTALL.sh` is the legacy systemd path; it is not used on the Docker host.)
 
 ## Working style
 - Surgical edits only — never rewrite whole files

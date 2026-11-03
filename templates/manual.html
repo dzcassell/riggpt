@@ -1271,7 +1271,7 @@ pip3 install openai-whisper --break-system-packages   # fallback
 <p>Press <strong>▶ START</strong>. The engine polls TX state every 200 ms (75 ms while transmitting) and on the TX→RX edge keys PTT itself, plays the enabled samples and un-keys. Set the IC-7610 MOD source to <code>MIC,USB</code> so samples mix into your TX audio. Samples are generated with sox on first use and cached in the live directory; jingle clips come from <code>/home/riggpt/clips/</code>. VFO WOBBLE modulates frequency during TX &mdash; keep depth/rate low.</p>
 
 <h3>Browser Stream (Chrome extension)</h3>
-<p>Install the extension from <code>chrome-extension/</code> in the repo (<code>chrome://extensions</code> → Developer mode → Load unpacked). In its popup set the RigGPT host (<code>192.168.40.10:5000</code>) and, if you set one here, the token. Open the tab you want to transmit, start playback, click <strong>▶ TRANSMIT THIS TAB</strong>.</p>
+<p>Install the extension from <code>chrome-extension/</code> in the repo (<code>chrome://extensions</code> → Developer mode → Load unpacked). In its popup set the RigGPT host (<code>192.168.40.15:5001</code>) and, if you set one here, the token. Open the tab you want to transmit, start playback, click <strong>▶ TRANSMIT THIS TAB</strong>.</p>
 <pre>
 Chrome tab ──tabCapture──▶ AudioWorklet (48 kHz mono Int16 PCM)
           ──WebSocket ws://host:5000/api/stream/tx──▶ RigGPT

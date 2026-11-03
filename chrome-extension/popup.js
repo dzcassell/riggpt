@@ -2,7 +2,7 @@ const $ = (id) => document.getElementById(id);
 let pollTimer = null;
 
 async function loadSettings() {
-  const s = await chrome.storage.local.get({ host: '192.168.40.10:5000', token: '', gain: 100, monitor: true });
+  const s = await chrome.storage.local.get({ host: '192.168.40.15:5001', token: '', gain: 100, monitor: true });
   $('host').value = s.host;
   $('token').value = s.token;
   $('gain').value = s.gain;

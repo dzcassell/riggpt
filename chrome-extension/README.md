@@ -14,12 +14,13 @@ Chrome tab ──tabCapture──▶ offscreen doc (AudioWorklet, 48 kHz mono PC
 
 ## Install (unpacked)
 
-1. On the radio machine, pull RigGPT v2.14.0+ and run `bash INSTALL.sh`
-   (adds the `flask-sock` dependency). Restart the service.
+1. On the RigGPT host, pull v2.14.0+ and redeploy (`docker compose up -d --build`
+   on the Docker host, or `bash INSTALL.sh` for a systemd install). Both pull
+   in the `flask-sock` dependency.
 2. In Chrome open `chrome://extensions`, turn on **Developer mode**, click
    **Load unpacked** and pick this `chrome-extension/` folder.
 3. Pin the extension. Click it, set **RigGPT host** to your server
-   (default `192.168.40.10:5000`). If you set a token in RigGPT
+   (default `192.168.40.15:5001`). If you set a token in RigGPT
    (LIVE tab → BROWSER STREAM → Token), enter the same token here.
 
 ## Use

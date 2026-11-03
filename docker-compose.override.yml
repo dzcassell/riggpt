@@ -1,0 +1,21 @@
+# Host-specific overrides for the production box rtx5070ti (192.168.40.15).
+# docker compose merges this over docker-compose.yml automatically.
+# - port 5000 on this host is taken by hermitsdr -> RigGPT on 5001 (bridge mode)
+# - Icom IC-7610 CI-V is port "A" of the CP2102 pair; mapped by its stable
+#   /dev/serial/by-id name so a ttyUSB0/1 swap after re-enumeration can't
+#   point CI-V at the wrong port
+# - USB Audio CODEC (Burr-Brown PCM2901) is ALSA card "CODEC"
+# If the radio is unplugged, `docker compose up -d` fails until it is back:
+# --device needs the node to exist at container start.
+services:
+  riggpt:
+    network_mode: bridge
+    ports: !override        # replace (not merge with) the base file's 5000:5000
+      - "5001:5000"
+    devices:
+      - /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_IC-7610_22001613_A-if00-port0:/dev/ttyUSB0
+      - /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_IC-7610_22001613_B-if00-port0:/dev/ttyUSB1
+      - /dev/snd:/dev/snd
+    environment:
+      RIGGPT_AUDIO_DEVICE: "plughw:CODEC"
+      TZ: America/New_York

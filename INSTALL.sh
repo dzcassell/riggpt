@@ -262,7 +262,7 @@ chmod 755 "$INSTALL_DIR"
 echo "[5/7] Installing Python dependencies..."
 pip3 install \
     flask flask-cors flask-sock pyserial requests apscheduler pysstv pillow numpy \
-    psutil edge-tts gtts pyttsx3 gunicorn gevent pydub pedalboard scipy \
+    psutil edge-tts gtts pyttsx3 gunicorn gevent packaging pydub pedalboard scipy \
     'discord.py[voice]' PyNaCl \
     --break-system-packages -q --root-user-action=ignore 2>&1 | grep -v "^$" || true
 

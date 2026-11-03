@@ -8,6 +8,7 @@ flask-sock>=0.7.0      # WebSocket for browser tab audio streaming (Chrome exten
 # Production WSGI server
 gunicorn>=21.2.0
 gevent>=23.9.0
+packaging>=23.0        # gunicorn's gevent worker imports it but does not declare it
 
 # Serial communication (CI-V)
 pyserial>=3.5

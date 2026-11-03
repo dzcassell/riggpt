@@ -6,7 +6,7 @@ FROM python:3.12-slim-bookworm
 
 LABEL maintainer="RigGPT" \
       description="AI ham radio platform — TTS, CI-V, Whisper, Acid Trip" \
-      version="2.13.1"
+      version="2.14.0"
 
 # ── System packages ──────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
